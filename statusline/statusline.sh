@@ -110,7 +110,9 @@ out+="effort: "
 case "$effort_level" in
     low)    out+="${dim}low${reset}" ;;
     medium) out+="${orange}med${reset}" ;;
-    *)      out+="${green}high${reset}" ;;
+    high)   out+="${green}high${reset}" ;;
+    xhigh)  out+="${red}xhigh${reset}" ;;
+    *)      out+="${white}${effort_level}${reset}" ;;
 esac
 
 # ===== Cross-platform OAuth token resolution (from statusline.sh) =====
