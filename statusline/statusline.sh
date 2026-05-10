@@ -167,7 +167,7 @@ get_oauth_token() {
 
 # ===== LINE 2 & 3: Usage limits with progress bars (cached) =====
 cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60  # seconds between API calls
+cache_max_age=300  # seconds between API calls (5 minutes)
 mkdir -p /tmp/claude
 
 needs_refresh=true

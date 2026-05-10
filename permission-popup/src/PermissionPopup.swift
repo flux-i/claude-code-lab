@@ -3,7 +3,20 @@ import Foundation
 
 // MARK: - Input Parsing
 
+enum ClientKind {
+    case claude
+    case codex
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude Code"
+        case .codex: return "Codex"
+        }
+    }
+}
+
 struct ToolInfo {
+    let client: ClientKind
     let toolName: String
     let details: String
     let cwd: String
@@ -13,7 +26,7 @@ struct ToolInfo {
 
 func readInput() -> ToolInfo {
     // Read in chunks until we have valid JSON.
-    // Cannot use readDataToEndOfFile() because Claude Code doesn't close stdin.
+    // Cannot use readDataToEndOfFile() because some hook runners don't close stdin.
     var allData = Data()
     let handle = FileHandle.standardInput
     while true {
@@ -26,9 +39,10 @@ func readInput() -> ToolInfo {
     }
     guard !allData.isEmpty,
           let json = try? JSONSerialization.jsonObject(with: allData) as? [String: Any] else {
-        return ToolInfo(toolName: "Unknown", details: "", cwd: "", sessionId: "", rawInput: [:])
+        return ToolInfo(client: detectClient(from: [:]), toolName: "Unknown", details: "", cwd: "", sessionId: "", rawInput: [:])
     }
 
+    let client = detectClient(from: json)
     let toolName = json["tool_name"] as? String ?? "Unknown"
     let toolInput = json["tool_input"] as? [String: Any] ?? [:]
     let cwd = json["cwd"] as? String ?? ""
@@ -59,7 +73,26 @@ func readInput() -> ToolInfo {
         details = ""
     }
 
-    return ToolInfo(toolName: toolName, details: details, cwd: cwd, sessionId: sessionId, rawInput: toolInput)
+    return ToolInfo(client: client, toolName: toolName, details: details, cwd: cwd, sessionId: sessionId, rawInput: toolInput)
+}
+
+func detectClient(from json: [String: Any]) -> ClientKind {
+    let forced = ProcessInfo.processInfo.environment["PERMISSION_POPUP_CLIENT"]?.lowercased()
+    if forced == "codex" { return .codex }
+    if forced == "claude" { return .claude }
+
+    if json["hook_event_name"] != nil || json["turn_id"] != nil || json["transcript_path"] != nil {
+        return .codex
+    }
+
+    return .claude
+}
+
+func expandHome(_ path: String) -> String {
+    guard path == "~" || path.hasPrefix("~/") else { return path }
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    if path == "~" { return home }
+    return (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
 }
 
 // MARK: - Output
@@ -88,7 +121,16 @@ func writeDeny(_ reason: String) {
 
 // MARK: - Always Allow
 
-func updateSettingsForAlwaysAllow(info: ToolInfo) {
+func updateAlwaysAllow(info: ToolInfo) {
+    switch info.client {
+    case .claude:
+        updateClaudeSettingsForAlwaysAllow(info: info)
+    case .codex:
+        updateCodexAllowListForAlwaysAllow(info: info)
+    }
+}
+
+func updateClaudeSettingsForAlwaysAllow(info: ToolInfo) {
     let pattern: String
     if info.toolName == "Bash", let command = info.rawInput["command"] as? String {
         // Extract the base command (first word) and use wildcard, e.g. "ls *"
@@ -103,7 +145,7 @@ func updateSettingsForAlwaysAllow(info: ToolInfo) {
         pattern = info.toolName
     }
 
-    let settingsPath = NSString(string: "~/.claude/settings.json").expandingTildeInPath
+    let settingsPath = expandHome("~/.claude/settings.json")
     let url = URL(fileURLWithPath: settingsPath)
 
     do {
@@ -127,6 +169,134 @@ func updateSettingsForAlwaysAllow(info: ToolInfo) {
             try data.write(to: url, options: .atomic)
         }
     } catch {}
+}
+
+func updateCodexAllowListForAlwaysAllow(info: ToolInfo) {
+    let pattern = allowPattern(for: info)
+    let allowPath = expandHome("~/.codex/permission-popup-allow.json")
+    let allowURL = URL(fileURLWithPath: allowPath)
+
+    do {
+        let dir = (allowPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        var allowList: [String] = []
+        if FileManager.default.fileExists(atPath: allowPath),
+           let data = try? Data(contentsOf: allowURL),
+           let existing = try JSONSerialization.jsonObject(with: data) as? [String] {
+            allowList = existing
+        }
+
+        if !allowList.contains(pattern) {
+            allowList.append(pattern)
+            let data = try JSONSerialization.data(withJSONObject: allowList, options: [.prettyPrinted])
+            try data.write(to: allowURL, options: .atomic)
+        }
+
+        updateCodexRulesForAlwaysAllow(info: info)
+    } catch {}
+}
+
+func updateCodexRulesForAlwaysAllow(info: ToolInfo) {
+    guard info.toolName == "Bash",
+          let command = info.rawInput["command"] as? String,
+          let baseCommand = shellCommandPrefix(command).first else {
+        return
+    }
+
+    let rulesPath = expandHome("~/.codex/rules/default.rules")
+    let rulesURL = URL(fileURLWithPath: rulesPath)
+
+    do {
+        let dir = (rulesPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let patternJSON = jsonString(["\(baseCommand)"])
+        let rule = #"prefix_rule(pattern=\#(patternJSON), decision="allow")"#
+        let existing = (try? String(contentsOf: rulesURL, encoding: .utf8)) ?? ""
+
+        if !existing.contains(rule) {
+            let prefix = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+            try (existing + prefix + rule + "\n").write(to: rulesURL, atomically: true, encoding: .utf8)
+        }
+    } catch {}
+}
+
+func allowPattern(for info: ToolInfo) -> String {
+    if info.toolName == "Bash",
+       let command = info.rawInput["command"] as? String,
+       let baseCommand = shellCommandPrefix(command).first {
+        return "Bash(\(baseCommand) *)"
+    } else if let filePath = info.rawInput["file_path"] as? String {
+        let dir = (filePath as NSString).deletingLastPathComponent
+        return "\(info.toolName)(\(dir)/*)"
+    } else {
+        return info.toolName
+    }
+}
+
+func shellCommandPrefix(_ command: String) -> [String] {
+    let tokens = shellTokens(command)
+    let skippedAssignments = tokens.drop(while: { token in
+        token.contains("=") && !token.hasPrefix("/") && !token.hasPrefix("./") && !token.hasPrefix("../")
+    })
+    return Array(skippedAssignments.prefix(1))
+}
+
+func shellTokens(_ command: String) -> [String] {
+    var tokens: [String] = []
+    var current = ""
+    var quote: Character?
+    var escaping = false
+
+    for char in command {
+        if escaping {
+            current.append(char)
+            escaping = false
+            continue
+        }
+
+        if char == "\\" {
+            escaping = true
+            continue
+        }
+
+        if let q = quote {
+            if char == q {
+                quote = nil
+            } else {
+                current.append(char)
+            }
+            continue
+        }
+
+        if char == "'" || char == "\"" {
+            quote = char
+        } else if char.isWhitespace {
+            if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        } else if char == ";" || char == "|" || char == "&" {
+            break
+        } else {
+            current.append(char)
+        }
+    }
+
+    if !current.isEmpty {
+        tokens.append(current)
+    }
+
+    return tokens
+}
+
+func jsonString(_ value: Any) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: value),
+          let string = String(data: data, encoding: .utf8) else {
+        return "[]"
+    }
+    return string
 }
 
 // MARK: - iTerm2 color reading
@@ -268,9 +438,13 @@ class PopupController: NSObject, NSWindowDelegate {
     func show() -> String {
         buildPanel()
 
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
-        panel.makeFirstResponder(panel.contentView)
+        focusPanel()
+        DispatchQueue.main.async { [weak self] in
+            self?.focusPanel()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.focusPanel()
+        }
         NSSound(named: "Purr")?.play()
 
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -290,6 +464,19 @@ class PopupController: NSObject, NSWindowDelegate {
         return result
     }
 
+    func focusPanel() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeMain()
+        panel.makeFirstResponder(panel.contentView)
+    }
+
     func buildPanel() {
         let w: CGFloat = 620
         let h: CGFloat = 420
@@ -300,7 +487,7 @@ class PopupController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        panel.title = "Claude Code"
+        panel.title = info.client.title
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.titlebarAppearsTransparent = true
         panel.backgroundColor = theme.bg
@@ -329,6 +516,9 @@ class PopupController: NSObject, NSWindowDelegate {
         }
 
         y -= 8
+
+        let btnW: CGFloat = 150
+        let btnH: CGFloat = 34
 
         // Command box - takes most of the space
         if !info.details.isEmpty {
@@ -372,8 +562,6 @@ class PopupController: NSObject, NSWindowDelegate {
         }
 
         // Buttons
-        let btnW: CGFloat = 150
-        let btnH: CGFloat = 34
         let spacing: CGFloat = 10
         let totalW = CGFloat(buttonTitles.count) * btnW + CGFloat(buttonTitles.count - 1) * spacing
         let startX = (w - totalW) / 2
@@ -482,7 +670,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "allow":
             writeAllow()
         case "always_allow":
-            updateSettingsForAlwaysAllow(info: info)
+            updateAlwaysAllow(info: info)
             writeAllow()  // _exit(0) - won't return
         case "deny":
             writeDeny("User denied via popup")
@@ -497,10 +685,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Allow List Check
 
 func isAlreadyAllowed(info: ToolInfo) -> Bool {
+    switch info.client {
+    case .claude:
+        return isAlreadyAllowedByClaudeSettings(info: info)
+    case .codex:
+        return isAlreadyAllowedByCodexSettings(info: info)
+    }
+}
+
+func isAlreadyAllowedByClaudeSettings(info: ToolInfo) -> Bool {
     // Read allow lists from both global and project settings
     let settingsPaths = [
-        NSString(string: "~/.claude/settings.json").expandingTildeInPath,
-        NSString(string: "~/.claude/settings.local.json").expandingTildeInPath,
+        expandHome("~/.claude/settings.json"),
+        expandHome("~/.claude/settings.local.json"),
         (info.cwd as NSString).appendingPathComponent(".claude/settings.json"),
         (info.cwd as NSString).appendingPathComponent(".claude/settings.local.json")
     ]
@@ -538,6 +735,38 @@ func isAlreadyAllowed(info: ToolInfo) -> Bool {
         } else if let filePath = filePath {
             if matchesWildcard(string: filePath, pattern: inner) { return true }
         }
+    }
+
+    return false
+}
+
+func isAlreadyAllowedByCodexSettings(info: ToolInfo) -> Bool {
+    let allowPath = expandHome("~/.codex/permission-popup-allow.json")
+    guard FileManager.default.fileExists(atPath: allowPath),
+          let data = try? Data(contentsOf: URL(fileURLWithPath: allowPath)),
+          let allowPatterns = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+        return false
+    }
+
+    return allowPatterns.contains { pattern in
+        matchesPermissionPattern(info: info, pattern: pattern)
+    }
+}
+
+func matchesPermissionPattern(info: ToolInfo, pattern: String) -> Bool {
+    let toolName = info.toolName
+    let command = info.rawInput["command"] as? String
+    let filePath = info.rawInput["file_path"] as? String
+
+    if pattern == toolName { return true }
+
+    guard pattern.hasPrefix("\(toolName)(") && pattern.hasSuffix(")") else { return false }
+    let inner = String(pattern.dropFirst(toolName.count + 1).dropLast())
+
+    if toolName == "Bash", let command = command {
+        return matchesWildcard(string: command, pattern: inner)
+    } else if let filePath = filePath {
+        return matchesWildcard(string: filePath, pattern: inner)
     }
 
     return false

@@ -5,6 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POPUP_BIN="$SCRIPT_DIR/bin/permission-popup"
+export PERMISSION_POPUP_CLIENT=claude
 
 # If binary not found, fall back to normal Claude Code prompt
 if [ ! -x "$POPUP_BIN" ]; then
