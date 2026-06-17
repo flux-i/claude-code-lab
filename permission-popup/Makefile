@@ -3,7 +3,7 @@ SOURCE = src/PermissionPopup.swift
 CLAUDE_INSTALL_DIR = $(HOME)/.claude/hooks/permission-popup
 CODEX_INSTALL_DIR = $(HOME)/.codex/hooks/permission-popup
 
-.PHONY: build install install-claude install-codex uninstall uninstall-claude uninstall-codex clean test test-codex
+.PHONY: build install install-claude install-codex uninstall uninstall-claude uninstall-codex clean test test-codex test-question
 
 build: $(BINARY)
 
@@ -83,3 +83,6 @@ test: build
 
 test-codex: build
 	@echo '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"npm test","description":"Need to run tests outside the sandbox"},"cwd":"/Users/test/my-project","session_id":"test-123","turn_id":"turn-123","model":"gpt-5.5"}' | PERMISSION_POPUP_CLIENT=codex ./$(BINARY)
+
+test-question: build
+	@echo '{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which database should we use for the new service?","header":"Database","multiSelect":false,"options":[{"label":"Postgres","description":"Relational, strong consistency, great tooling. Best default for most apps."},{"label":"MongoDB","description":"Document store, flexible schema, good for rapidly changing data shapes."},{"label":"SQLite","description":"Embedded, zero-config, ideal for local or low-concurrency workloads."}]},{"question":"Which features should the first release include?","header":"Features","multiSelect":true,"options":[{"label":"Auth","description":"Email/password and OAuth login."},{"label":"Billing","description":"Stripe-based subscriptions."},{"label":"Notifications","description":"Email and in-app notifications."}]}]},"cwd":"/Users/test/my-project","session_id":"test-123"}' | PERMISSION_POPUP_CLIENT=claude ./$(BINARY)

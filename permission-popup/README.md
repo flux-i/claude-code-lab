@@ -4,6 +4,17 @@ A native macOS popup that replaces Claude Code and Codex in-terminal permission 
 
 It hooks into each tool's `PermissionRequest` event, so the agent keeps using its normal approval protocol while you get a real OS dialog instead of a TUI prompt.
 
+## Claude Code questions (AskUserQuestion)
+
+When Claude Code asks you a multiple-choice question (the `AskUserQuestion` tool), the popup renders it as an interactive picker instead of a raw permission prompt:
+
+- Each question is shown with its options as selectable rows. Single-select questions behave like radio buttons; `multiSelect` questions let you toggle several. Multiple questions in one call are stacked and scroll.
+- **Navigate** with ↑/↓ (or `j`/`k`), **select** with space or a click, **submit** with ⏎.
+- **Answer in terminal** (button, or ⌘⏎) hands the question back to Claude Code's native UI — use this when you need to type a free-text "Other" answer the popup can't capture.
+- **esc** dismisses without answering.
+
+A `PermissionRequest` hook can only return allow/deny, not a tool result — so submitted answers are delivered back to Claude as a `deny` whose `message` lists your choices (e.g. *"Q: Which database? → Postgres"*). Claude reads that message and continues as if you'd answered. "Answer in terminal" returns `allow`, which lets Claude show its own question UI.
+
 ## Supported platforms
 
 - **macOS only.** The popup is written in Swift against Cocoa/AppKit.
@@ -77,11 +88,12 @@ Then remove the `PermissionRequest` entry from the relevant config file.
 ## Test
 
 ```sh
-make test        # Claude-style sample payload
-make test-codex  # Codex-style sample payload
+make test           # Claude-style permission payload
+make test-codex     # Codex-style permission payload
+make test-question  # Claude AskUserQuestion payload (multi-question + multiSelect)
 ```
 
-Feeds a sample `PermissionRequest` event to the binary so you can see the popup without running Claude Code or Codex.
+Feeds a sample event to the binary so you can see the popup without running Claude Code or Codex.
 
 ## Layout
 
