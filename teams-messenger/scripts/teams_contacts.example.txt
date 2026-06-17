@@ -1,0 +1,6 @@
+# Teams contacts — "Name = email", one per line.
+# Names are matched case-insensitively (partial match OK).
+# Copy this file to teams_contacts.txt (which is gitignored) and fill in real contacts.
+# Example org pattern: firstname.lastinitial@company.com
+Jane Doe = jane.d@example.com
+John Smith = john.s@example.com
