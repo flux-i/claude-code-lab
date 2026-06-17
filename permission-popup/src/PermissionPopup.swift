@@ -3,7 +3,20 @@ import Foundation
 
 // MARK: - Input Parsing
 
+enum ClientKind {
+    case claude
+    case codex
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude Code"
+        case .codex: return "Codex"
+        }
+    }
+}
+
 struct ToolInfo {
+    let client: ClientKind
     let toolName: String
     let details: String
     let cwd: String
@@ -13,7 +26,7 @@ struct ToolInfo {
 
 func readInput() -> ToolInfo {
     // Read in chunks until we have valid JSON.
-    // Cannot use readDataToEndOfFile() because Claude Code doesn't close stdin.
+    // Cannot use readDataToEndOfFile() because some hook runners don't close stdin.
     var allData = Data()
     let handle = FileHandle.standardInput
     while true {
@@ -26,9 +39,10 @@ func readInput() -> ToolInfo {
     }
     guard !allData.isEmpty,
           let json = try? JSONSerialization.jsonObject(with: allData) as? [String: Any] else {
-        return ToolInfo(toolName: "Unknown", details: "", cwd: "", sessionId: "", rawInput: [:])
+        return ToolInfo(client: detectClient(from: [:]), toolName: "Unknown", details: "", cwd: "", sessionId: "", rawInput: [:])
     }
 
+    let client = detectClient(from: json)
     let toolName = json["tool_name"] as? String ?? "Unknown"
     let toolInput = json["tool_input"] as? [String: Any] ?? [:]
     let cwd = json["cwd"] as? String ?? ""
@@ -59,7 +73,56 @@ func readInput() -> ToolInfo {
         details = ""
     }
 
-    return ToolInfo(toolName: toolName, details: details, cwd: cwd, sessionId: sessionId, rawInput: toolInput)
+    return ToolInfo(client: client, toolName: toolName, details: details, cwd: cwd, sessionId: sessionId, rawInput: toolInput)
+}
+
+func detectClient(from json: [String: Any]) -> ClientKind {
+    let forced = ProcessInfo.processInfo.environment["PERMISSION_POPUP_CLIENT"]?.lowercased()
+    if forced == "codex" { return .codex }
+    if forced == "claude" { return .claude }
+
+    if json["hook_event_name"] != nil || json["turn_id"] != nil || json["transcript_path"] != nil {
+        return .codex
+    }
+
+    return .claude
+}
+
+func expandHome(_ path: String) -> String {
+    guard path == "~" || path.hasPrefix("~/") else { return path }
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    if path == "~" { return home }
+    return (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
+}
+
+// MARK: - AskUserQuestion model
+
+struct QOption {
+    let label: String
+    let description: String
+}
+
+struct Question {
+    let question: String
+    let header: String
+    let multiSelect: Bool
+    let options: [QOption]
+}
+
+func parseQuestions(from toolInput: [String: Any]) -> [Question] {
+    guard let raw = toolInput["questions"] as? [[String: Any]] else { return [] }
+    return raw.map { q in
+        let opts = (q["options"] as? [[String: Any]] ?? []).map { o in
+            QOption(label: o["label"] as? String ?? "",
+                    description: o["description"] as? String ?? "")
+        }
+        return Question(
+            question: q["question"] as? String ?? "",
+            header: q["header"] as? String ?? "",
+            multiSelect: q["multiSelect"] as? Bool ?? false,
+            options: opts
+        )
+    }
 }
 
 // MARK: - Output
@@ -86,9 +149,37 @@ func writeDeny(_ reason: String) {
     _exit(0)
 }
 
+// Deny with an arbitrary message. Built via JSONSerialization so multi-line
+// messages (e.g. answers to AskUserQuestion) are escaped correctly.
+func writeDenyMessage(_ message: String) {
+    let payload: [String: Any] = [
+        "hookSpecificOutput": [
+            "hookEventName": "PermissionRequest",
+            "decision": ["behavior": "deny", "message": message]
+        ]
+    ]
+    if var data = try? JSONSerialization.data(withJSONObject: payload) {
+        data.append(0x0A)
+        data.withUnsafeBytes { buf in
+            if let base = buf.baseAddress { _ = Darwin.write(STDOUT_FILENO, base, buf.count) }
+        }
+    }
+    close(STDOUT_FILENO)
+    _exit(0)
+}
+
 // MARK: - Always Allow
 
-func updateSettingsForAlwaysAllow(info: ToolInfo) {
+func updateAlwaysAllow(info: ToolInfo) {
+    switch info.client {
+    case .claude:
+        updateClaudeSettingsForAlwaysAllow(info: info)
+    case .codex:
+        updateCodexAllowListForAlwaysAllow(info: info)
+    }
+}
+
+func updateClaudeSettingsForAlwaysAllow(info: ToolInfo) {
     let pattern: String
     if info.toolName == "Bash", let command = info.rawInput["command"] as? String {
         // Extract the base command (first word) and use wildcard, e.g. "ls *"
@@ -103,7 +194,7 @@ func updateSettingsForAlwaysAllow(info: ToolInfo) {
         pattern = info.toolName
     }
 
-    let settingsPath = NSString(string: "~/.claude/settings.json").expandingTildeInPath
+    let settingsPath = expandHome("~/.claude/settings.json")
     let url = URL(fileURLWithPath: settingsPath)
 
     do {
@@ -127,6 +218,134 @@ func updateSettingsForAlwaysAllow(info: ToolInfo) {
             try data.write(to: url, options: .atomic)
         }
     } catch {}
+}
+
+func updateCodexAllowListForAlwaysAllow(info: ToolInfo) {
+    let pattern = allowPattern(for: info)
+    let allowPath = expandHome("~/.codex/permission-popup-allow.json")
+    let allowURL = URL(fileURLWithPath: allowPath)
+
+    do {
+        let dir = (allowPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        var allowList: [String] = []
+        if FileManager.default.fileExists(atPath: allowPath),
+           let data = try? Data(contentsOf: allowURL),
+           let existing = try JSONSerialization.jsonObject(with: data) as? [String] {
+            allowList = existing
+        }
+
+        if !allowList.contains(pattern) {
+            allowList.append(pattern)
+            let data = try JSONSerialization.data(withJSONObject: allowList, options: [.prettyPrinted])
+            try data.write(to: allowURL, options: .atomic)
+        }
+
+        updateCodexRulesForAlwaysAllow(info: info)
+    } catch {}
+}
+
+func updateCodexRulesForAlwaysAllow(info: ToolInfo) {
+    guard info.toolName == "Bash",
+          let command = info.rawInput["command"] as? String,
+          let baseCommand = shellCommandPrefix(command).first else {
+        return
+    }
+
+    let rulesPath = expandHome("~/.codex/rules/default.rules")
+    let rulesURL = URL(fileURLWithPath: rulesPath)
+
+    do {
+        let dir = (rulesPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let patternJSON = jsonString(["\(baseCommand)"])
+        let rule = #"prefix_rule(pattern=\#(patternJSON), decision="allow")"#
+        let existing = (try? String(contentsOf: rulesURL, encoding: .utf8)) ?? ""
+
+        if !existing.contains(rule) {
+            let prefix = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+            try (existing + prefix + rule + "\n").write(to: rulesURL, atomically: true, encoding: .utf8)
+        }
+    } catch {}
+}
+
+func allowPattern(for info: ToolInfo) -> String {
+    if info.toolName == "Bash",
+       let command = info.rawInput["command"] as? String,
+       let baseCommand = shellCommandPrefix(command).first {
+        return "Bash(\(baseCommand) *)"
+    } else if let filePath = info.rawInput["file_path"] as? String {
+        let dir = (filePath as NSString).deletingLastPathComponent
+        return "\(info.toolName)(\(dir)/*)"
+    } else {
+        return info.toolName
+    }
+}
+
+func shellCommandPrefix(_ command: String) -> [String] {
+    let tokens = shellTokens(command)
+    let skippedAssignments = tokens.drop(while: { token in
+        token.contains("=") && !token.hasPrefix("/") && !token.hasPrefix("./") && !token.hasPrefix("../")
+    })
+    return Array(skippedAssignments.prefix(1))
+}
+
+func shellTokens(_ command: String) -> [String] {
+    var tokens: [String] = []
+    var current = ""
+    var quote: Character?
+    var escaping = false
+
+    for char in command {
+        if escaping {
+            current.append(char)
+            escaping = false
+            continue
+        }
+
+        if char == "\\" {
+            escaping = true
+            continue
+        }
+
+        if let q = quote {
+            if char == q {
+                quote = nil
+            } else {
+                current.append(char)
+            }
+            continue
+        }
+
+        if char == "'" || char == "\"" {
+            quote = char
+        } else if char.isWhitespace {
+            if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        } else if char == ";" || char == "|" || char == "&" {
+            break
+        } else {
+            current.append(char)
+        }
+    }
+
+    if !current.isEmpty {
+        tokens.append(current)
+    }
+
+    return tokens
+}
+
+func jsonString(_ value: Any) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: value),
+          let string = String(data: data, encoding: .utf8) else {
+        return "[]"
+    }
+    return string
 }
 
 // MARK: - iTerm2 color reading
@@ -268,9 +487,13 @@ class PopupController: NSObject, NSWindowDelegate {
     func show() -> String {
         buildPanel()
 
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
-        panel.makeFirstResponder(panel.contentView)
+        focusPanel()
+        DispatchQueue.main.async { [weak self] in
+            self?.focusPanel()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.focusPanel()
+        }
         NSSound(named: "Purr")?.play()
 
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -290,6 +513,19 @@ class PopupController: NSObject, NSWindowDelegate {
         return result
     }
 
+    func focusPanel() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeMain()
+        panel.makeFirstResponder(panel.contentView)
+    }
+
     func buildPanel() {
         let w: CGFloat = 620
         let h: CGFloat = 420
@@ -300,7 +536,7 @@ class PopupController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        panel.title = "Claude Code"
+        panel.title = info.client.title
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.titlebarAppearsTransparent = true
         panel.backgroundColor = theme.bg
@@ -329,6 +565,9 @@ class PopupController: NSObject, NSWindowDelegate {
         }
 
         y -= 8
+
+        let btnW: CGFloat = 150
+        let btnH: CGFloat = 34
 
         // Command box - takes most of the space
         if !info.details.isEmpty {
@@ -372,8 +611,6 @@ class PopupController: NSObject, NSWindowDelegate {
         }
 
         // Buttons
-        let btnW: CGFloat = 150
-        let btnH: CGFloat = 34
         let spacing: CGFloat = 10
         let totalW = CGFloat(buttonTitles.count) * btnW + CGFloat(buttonTitles.count - 1) * spacing
         let startX = (w - totalW) / 2
@@ -482,7 +719,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "allow":
             writeAllow()
         case "always_allow":
-            updateSettingsForAlwaysAllow(info: info)
+            updateAlwaysAllow(info: info)
             writeAllow()  // _exit(0) - won't return
         case "deny":
             writeDeny("User denied via popup")
@@ -494,13 +731,436 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Question Popup (AskUserQuestion)
+
+enum QuestionOutcome {
+    case answered(String)   // deny + message carrying the user's choices
+    case terminal           // allow -> let Claude Code show its native question UI
+    case dismissed          // deny + "no answer" message
+}
+
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+// A selectable option row. Flipped so its subviews lay out top-down.
+class QuestionRowView: NSView {
+    var onClick: (() -> Void)?
+    override var isFlipped: Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
+class QuestionPopupController: NSObject, NSWindowDelegate {
+    let info: ToolInfo
+    let questions: [Question]
+    let theme: Theme
+
+    var panel: PermissionPanel!
+    var scrollView: NSScrollView!
+
+    // Flat list of option rows across all questions, for keyboard navigation.
+    var rowViews: [QuestionRowView] = []
+    var rowMarkers: [NSTextField] = []
+    var rowLabels: [NSTextField] = []
+    var rowMap: [(q: Int, o: Int)] = []
+    var selections: [Set<Int>] = []   // selected option indices, per question
+    var focusedRow = 0
+
+    var outcome: QuestionOutcome = .dismissed
+    var resolved = false
+    var timeoutTimer: Timer?
+    var eventMonitor: Any?
+
+    init(info: ToolInfo, questions: [Question], theme: Theme) {
+        self.info = info
+        self.questions = questions
+        self.theme = theme
+        self.selections = Array(repeating: Set<Int>(), count: questions.count)
+        super.init()
+    }
+
+    func show() -> QuestionOutcome {
+        buildPanel()
+
+        focusPanel()
+        DispatchQueue.main.async { [weak self] in self?.focusPanel() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.focusPanel() }
+        NSSound(named: "Purr")?.play()
+
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            if self.handleKey(event) { return nil }
+            return event
+        }
+
+        timeoutTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
+            self?.finish(.dismissed)
+        }
+
+        NSApp.runModal(for: panel)
+
+        if let m = eventMonitor { NSEvent.removeMonitor(m) }
+        timeoutTimer?.invalidate()
+        return outcome
+    }
+
+    func focusPanel() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeMain()
+        panel.makeFirstResponder(panel.contentView)
+    }
+
+    func makeWrap(_ s: String, font: NSFont, color: NSColor, width: CGFloat) -> NSTextField {
+        let f = NSTextField(wrappingLabelWithString: s)
+        f.font = font
+        f.textColor = color
+        f.isSelectable = false
+        f.drawsBackground = false
+        f.isBezeled = false
+        f.preferredMaxLayoutWidth = width
+        var fr = f.frame
+        fr.size.width = width
+        fr.size.height = f.fittingSize.height
+        f.frame = fr
+        return f
+    }
+
+    func buildPanel() {
+        let w: CGFloat = 640
+        let sideMargin: CGFloat = 16
+        let innerWidth = w - sideMargin * 2     // documentView width
+        let textLeft: CGFloat = 8
+        let textWidth = innerWidth - textLeft * 2
+        let markerW: CGFloat = 18
+        let optTextLeft: CGFloat = 34
+        let optTextWidth = innerWidth - optTextLeft - 12
+
+        // --- Build the (flipped) document view, measuring as we stack ---
+        let doc = FlippedView(frame: NSRect(x: 0, y: 0, width: innerWidth, height: 10))
+        var y: CGFloat = 14
+
+        for (qi, q) in questions.enumerated() {
+            if !q.header.isEmpty {
+                let hl = NSTextField(labelWithString: q.header.uppercased())
+                hl.font = .systemFont(ofSize: 10, weight: .semibold)
+                hl.textColor = theme.blue
+                hl.frame = NSRect(x: textLeft, y: y, width: textWidth, height: 13)
+                doc.addSubview(hl)
+                y += 16
+            }
+
+            let ql = makeWrap(q.question, font: .systemFont(ofSize: 15, weight: .semibold),
+                              color: theme.text, width: textWidth)
+            ql.frame.origin = CGPoint(x: textLeft, y: y)
+            doc.addSubview(ql)
+            y += ql.frame.height + 8
+
+            for (oi, opt) in q.options.enumerated() {
+                let labelField = makeWrap(opt.label, font: .systemFont(ofSize: 13, weight: .medium),
+                                          color: theme.text, width: optTextWidth)
+                let descField = opt.description.isEmpty ? nil
+                    : makeWrap(opt.description, font: .systemFont(ofSize: 11.5, weight: .regular),
+                               color: theme.dimText, width: optTextWidth)
+
+                let rowTop: CGFloat = 8
+                let lh = labelField.frame.height
+                let dh = descField?.frame.height ?? 0
+                let gap: CGFloat = descField == nil ? 0 : 3
+                let rowH = rowTop + lh + gap + dh + 8
+
+                let row = QuestionRowView(frame: NSRect(x: textLeft, y: y, width: textWidth, height: rowH))
+                row.wantsLayer = true
+                row.layer?.cornerRadius = 7
+                row.layer?.borderWidth = 1.5
+                row.layer?.borderColor = theme.border.cgColor
+                row.layer?.backgroundColor = theme.btnBg.cgColor
+
+                let marker = NSTextField(labelWithString: "")
+                marker.font = .systemFont(ofSize: 13, weight: .regular)
+                marker.alignment = .center
+                marker.frame = NSRect(x: 8, y: rowTop, width: markerW, height: 16)
+                row.addSubview(marker)
+
+                labelField.frame.origin = CGPoint(x: optTextLeft, y: rowTop)
+                row.addSubview(labelField)
+                if let descField = descField {
+                    descField.frame.origin = CGPoint(x: optTextLeft, y: rowTop + lh + gap)
+                    row.addSubview(descField)
+                }
+
+                let flat = rowViews.count
+                row.onClick = { [weak self] in self?.clickRow(flat) }
+                doc.addSubview(row)
+
+                rowViews.append(row)
+                rowMarkers.append(marker)
+                rowLabels.append(labelField)
+                rowMap.append((qi, oi))
+
+                y += rowH + 6
+            }
+
+            y += 12  // gap between questions
+        }
+
+        let contentHeight = y
+
+        // --- Window geometry ---
+        let pathH: CGFloat = info.cwd.isEmpty ? 10 : 30
+        let footerBottom: CGFloat = 14
+        let buttonH: CGFloat = 34
+        let footerH: CGFloat = 82
+        let maxScroll: CGFloat = 520
+        let scrollH = max(min(contentHeight, maxScroll), 80)
+        let h = pathH + scrollH + footerH
+
+        panel = PermissionPanel(
+            contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = info.client.title
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.titlebarAppearsTransparent = true
+        panel.backgroundColor = theme.bg
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.center()
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+
+        let cv = panel.contentView!
+        cv.wantsLayer = true
+        cv.layer?.backgroundColor = theme.bg.cgColor
+
+        // Project path
+        if !info.cwd.isEmpty {
+            let pathLabel = NSTextField(labelWithString: info.cwd)
+            pathLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            pathLabel.textColor = theme.dimText
+            pathLabel.lineBreakMode = .byTruncatingMiddle
+            pathLabel.frame = NSRect(x: sideMargin, y: h - 24, width: w - sideMargin * 2, height: 14)
+            cv.addSubview(pathLabel)
+        }
+
+        // Scrollable questions
+        scrollView = NSScrollView(frame: NSRect(x: sideMargin, y: footerH, width: innerWidth, height: h - pathH - footerH))
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.scrollerStyle = .overlay
+        doc.frame = NSRect(x: 0, y: 0, width: innerWidth, height: contentHeight)
+        scrollView.documentView = doc
+        cv.addSubview(scrollView)
+        doc.scroll(NSPoint(x: 0, y: 0))
+
+        // Footer buttons
+        let footerTitles = ["Submit", "Answer in terminal"]
+        let footerColors = [theme.green, theme.blue]
+        let footerWidths: [CGFloat] = [150, 200]
+        let spacing: CGFloat = 12
+        let totalFW = footerWidths.reduce(0, +) + spacing * CGFloat(footerWidths.count - 1)
+        var fx = (w - totalFW) / 2
+
+        for i in 0..<footerTitles.count {
+            let bw = footerWidths[i]
+            let bv = NSView(frame: NSRect(x: fx, y: footerBottom, width: bw, height: buttonH))
+            bv.wantsLayer = true
+            bv.layer?.cornerRadius = 8
+            bv.layer?.backgroundColor = footerColors[i].withAlphaComponent(0.12).cgColor
+            bv.layer?.borderWidth = 1.5
+            bv.layer?.borderColor = footerColors[i].cgColor
+            cv.addSubview(bv)
+
+            let lbl = NSTextField(labelWithString: footerTitles[i])
+            lbl.font = .systemFont(ofSize: 13, weight: .semibold)
+            lbl.textColor = footerColors[i]
+            lbl.alignment = .center
+            lbl.frame = NSRect(x: 0, y: (buttonH - 16) / 2, width: bw, height: 16)
+            bv.addSubview(lbl)
+
+            let click = ClickableView(frame: NSRect(x: 0, y: 0, width: bw, height: buttonH))
+            if i == 0 {
+                click.onClick = { [weak self] in self?.submit() }
+            } else {
+                click.onClick = { [weak self] in self?.finish(.terminal) }
+            }
+            bv.addSubview(click)
+
+            fx += bw + spacing
+        }
+
+        // Keyboard hint
+        let hint = NSTextField(labelWithString: "↑↓ navigate · space select · ⏎ submit · ⌘⏎ terminal · esc cancel")
+        hint.font = .systemFont(ofSize: 10.5, weight: .regular)
+        hint.textColor = theme.dimText
+        hint.alignment = .center
+        hint.frame = NSRect(x: sideMargin, y: footerBottom + buttonH + 6, width: w - sideMargin * 2, height: 14)
+        cv.addSubview(hint)
+
+        refresh()
+    }
+
+    func handleKey(_ event: NSEvent) -> Bool {
+        let cmd = event.modifierFlags.contains(.command)
+        if let chars = event.charactersIgnoringModifiers?.lowercased() {
+            switch chars {
+            case "\r":
+                if cmd { finish(.terminal) } else { submit() }
+                return true
+            case "\u{1b}": finish(.dismissed); return true
+            case " ": toggleSelection(focusedRow); refresh(); return true
+            case "j": move(1); return true
+            case "k": move(-1); return true
+            default: break
+            }
+        }
+
+        switch event.keyCode {
+        case 125: move(1); return true   // Down
+        case 126: move(-1); return true  // Up
+        default: break
+        }
+
+        return false
+    }
+
+    func move(_ delta: Int) {
+        guard !rowViews.isEmpty else { return }
+        focusedRow = (focusedRow + delta + rowViews.count) % rowViews.count
+        refresh()
+        let r = rowViews[focusedRow]
+        r.scrollToVisible(r.bounds)
+    }
+
+    func clickRow(_ i: Int) {
+        focusedRow = i
+        toggleSelection(i)
+        refresh()
+    }
+
+    func toggleSelection(_ i: Int) {
+        guard i >= 0 && i < rowMap.count else { return }
+        let (qi, oi) = rowMap[i]
+        if questions[qi].multiSelect {
+            if selections[qi].contains(oi) { selections[qi].remove(oi) }
+            else { selections[qi].insert(oi) }
+        } else {
+            selections[qi] = [oi]
+        }
+    }
+
+    func refresh() {
+        let accent = theme.green
+        for (i, row) in rowViews.enumerated() {
+            let (qi, oi) = rowMap[i]
+            let selected = selections[qi].contains(oi)
+            let multi = questions[qi].multiSelect
+            rowMarkers[i].stringValue = selected ? (multi ? "☑" : "●") : (multi ? "☐" : "○")
+            rowMarkers[i].textColor = selected ? accent : theme.dimText
+            rowLabels[i].textColor = selected ? accent : theme.text
+
+            if i == focusedRow {
+                row.layer?.borderColor = accent.cgColor
+                row.layer?.borderWidth = 2
+                row.layer?.backgroundColor = accent.withAlphaComponent(selected ? 0.16 : 0.08).cgColor
+            } else if selected {
+                row.layer?.borderColor = accent.withAlphaComponent(0.6).cgColor
+                row.layer?.borderWidth = 1.5
+                row.layer?.backgroundColor = accent.withAlphaComponent(0.12).cgColor
+            } else {
+                row.layer?.borderColor = theme.border.cgColor
+                row.layer?.borderWidth = 1.5
+                row.layer?.backgroundColor = theme.btnBg.cgColor
+            }
+        }
+    }
+
+    func buildAnswerMessage() -> String {
+        var lines: [String] = ["The user answered the following via the popup dialog. Use these as their responses:"]
+        for (qi, q) in questions.enumerated() {
+            let chosen = selections[qi].sorted().map { q.options[$0].label }
+            lines.append("")
+            let head = q.header.isEmpty ? "" : "[\(q.header)] "
+            lines.append("Q: \(head)\(q.question)")
+            lines.append("A: " + (chosen.isEmpty ? "(no selection)" : chosen.joined(separator: ", ")))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    func submit() {
+        finish(.answered(buildAnswerMessage()))
+    }
+
+    func finish(_ o: QuestionOutcome) {
+        resolved = true
+        outcome = o
+        NSApp.stopModal()
+        panel.orderOut(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if !resolved {
+            outcome = .dismissed
+            NSApp.stopModal()
+        }
+    }
+}
+
+class QuestionAppDelegate: NSObject, NSApplicationDelegate {
+    let info: ToolInfo
+    let questions: [Question]
+
+    init(info: ToolInfo, questions: [Question]) {
+        self.info = info
+        self.questions = questions
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let theme = Theme.fromITerm2()
+        let controller = QuestionPopupController(info: info, questions: questions, theme: theme)
+        let outcome = controller.show()
+
+        switch outcome {
+        case .answered(let message):
+            writeDenyMessage(message)        // _exit(0) - won't return
+        case .terminal:
+            writeAllow()                     // let Claude Code show its native question UI
+        case .dismissed:
+            writeDenyMessage("The user closed the popup without answering the question.")
+        }
+
+        _exit(1)  // fallback - should never reach here
+    }
+}
+
 // MARK: - Allow List Check
 
 func isAlreadyAllowed(info: ToolInfo) -> Bool {
+    switch info.client {
+    case .claude:
+        return isAlreadyAllowedByClaudeSettings(info: info)
+    case .codex:
+        return isAlreadyAllowedByCodexSettings(info: info)
+    }
+}
+
+func isAlreadyAllowedByClaudeSettings(info: ToolInfo) -> Bool {
     // Read allow lists from both global and project settings
     let settingsPaths = [
-        NSString(string: "~/.claude/settings.json").expandingTildeInPath,
-        NSString(string: "~/.claude/settings.local.json").expandingTildeInPath,
+        expandHome("~/.claude/settings.json"),
+        expandHome("~/.claude/settings.local.json"),
         (info.cwd as NSString).appendingPathComponent(".claude/settings.json"),
         (info.cwd as NSString).appendingPathComponent(".claude/settings.local.json")
     ]
@@ -543,6 +1203,38 @@ func isAlreadyAllowed(info: ToolInfo) -> Bool {
     return false
 }
 
+func isAlreadyAllowedByCodexSettings(info: ToolInfo) -> Bool {
+    let allowPath = expandHome("~/.codex/permission-popup-allow.json")
+    guard FileManager.default.fileExists(atPath: allowPath),
+          let data = try? Data(contentsOf: URL(fileURLWithPath: allowPath)),
+          let allowPatterns = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+        return false
+    }
+
+    return allowPatterns.contains { pattern in
+        matchesPermissionPattern(info: info, pattern: pattern)
+    }
+}
+
+func matchesPermissionPattern(info: ToolInfo, pattern: String) -> Bool {
+    let toolName = info.toolName
+    let command = info.rawInput["command"] as? String
+    let filePath = info.rawInput["file_path"] as? String
+
+    if pattern == toolName { return true }
+
+    guard pattern.hasPrefix("\(toolName)(") && pattern.hasSuffix(")") else { return false }
+    let inner = String(pattern.dropFirst(toolName.count + 1).dropLast())
+
+    if toolName == "Bash", let command = command {
+        return matchesWildcard(string: command, pattern: inner)
+    } else if let filePath = filePath {
+        return matchesWildcard(string: filePath, pattern: inner)
+    }
+
+    return false
+}
+
 func matchesWildcard(string: String, pattern: String) -> Bool {
     // Simple wildcard matching: * matches any sequence of characters
     // Split pattern by * and check if parts appear in order
@@ -572,13 +1264,20 @@ func matchesWildcard(string: String, pattern: String) -> Bool {
 
 let info = readInput()
 
-// Skip popup if already allowed by settings
-if isAlreadyAllowed(info: info) {
+// AskUserQuestion is rendered as an interactive question popup instead of an
+// allow/deny prompt. The chosen answers are returned to Claude via deny+message.
+let parsedQuestions = parseQuestions(from: info.rawInput)
+let isQuestion = info.toolName == "AskUserQuestion" && !parsedQuestions.isEmpty
+
+// Skip popup if already allowed by settings (never auto-skip a question).
+if !isQuestion && isAlreadyAllowed(info: info) {
     writeAllow()
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = AppDelegate(info: info)
+let delegate: NSApplicationDelegate = isQuestion
+    ? QuestionAppDelegate(info: info, questions: parsedQuestions)
+    : AppDelegate(info: info)
 app.delegate = delegate
 app.run()
