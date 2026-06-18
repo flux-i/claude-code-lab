@@ -212,7 +212,7 @@ final class HUDController {
 
 // MARK: - App delegate ────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate, URLSessionDataDelegate {
 
     // Config
     private let triggerKeyCode: UInt16 = 54 // Right Command
@@ -227,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private let ttsPort = 8765
     private let ttsRunScript = ("~/.claude/voice/tts-server/run.sh" as NSString).expandingTildeInPath
     private var ttsURL: URL { URL(string: "http://127.0.0.1:\(ttsPort)/tts")! }
+    private var ttsStreamURL: URL { URL(string: "http://127.0.0.1:\(ttsPort)/tts_stream")! }
     private var ttsHealthURL: URL { URL(string: "http://127.0.0.1:\(ttsPort)/health")! }
     private var audioPlayer: AVAudioPlayer?
     private var karaokeTimer: Timer?
@@ -276,6 +277,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var gotResult = false             // a RESULT line arrived this turn
     private var runID = 0                     // bumped each turn; stale callbacks are dropped
     private var lastEnqueued = ""             // de-dupe: skip a segment identical to the previous
+
+    // Streamed RESULT playback. The final reply is fetched from /tts_stream as
+    // length-framed WAV chunks ([4-byte big-endian length][WAV]) and played gaplessly
+    // the instant each arrives — first word in ~a few seconds regardless of length,
+    // then continuous (the server keeps a synthesis lead so playback never underruns).
+    // Short narration (SAY/TOOL/ALERT, the "On it…" ack) still uses the batch queue
+    // above; only the long final answer streams. The next chunk's player is prepared
+    // while the current one plays so chunk-to-chunk transitions are seamless.
+    private var streaming = false             // a /tts_stream RESULT is in flight
+    private var streamPlaying = false         // a streamed chunk is currently playing
+    private var streamEOF = false             // the server has sent every frame
+    private var gotStreamAudio = false        // at least one frame arrived (else → fallback)
+    private var streamChunks: [Data] = []     // received-but-not-yet-prepared WAV frames
+    private var streamNextPlayer: AVAudioPlayer?  // the following chunk, prepared ahead
+    private var streamBuffer = Data()         // raw bytes awaiting frame parsing
+    private var streamText = ""               // full reply text (HUD + system-voice fallback)
+    private var pendingResult: String?        // RESULT waiting for the batch queue to drain
+    private var streamTask: URLSessionDataTask?
+    private var streamSession: URLSession?
 
     // Deferred ack: break the silence only when Claude takes a while. A short cue is
     // spoken if nothing real has been said within `ackDelay`; cancelled the instant
@@ -422,7 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         guard !isRecording else { return }
         // Barge-in: pressing the key mid-response (thinking or speaking) cancels it and
         // starts a fresh listen. The new command runs once you release the key.
-        if agentRunning || isSpeaking || !speechQueue.isEmpty { cancelCurrentOperation() }
+        if agentRunning || isSpeaking || streaming || !speechQueue.isEmpty { cancelCurrentOperation() }
         guard let recognizer = recognizer, recognizer.isAvailable else {
             flash(.error, error: "Speech recognition isn't ready yet."); return
         }
@@ -634,7 +654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         // narration or the answer arrives (see dispatchProtocolLine), so quick replies
         // never hear it — the violet "thinking" orb covers the gap until then.
         ackTimer?.invalidate()
-        let cue = ackCues[ackIndex % ackCues.count]; ackIndex += 1
+        // Pick a random cue (not sequential), avoiding an immediate repeat of the last one.
+        var cueIndex = Int.random(in: 0..<ackCues.count)
+        if ackCues.count > 1 && cueIndex == ackIndex { cueIndex = (cueIndex + 1) % ackCues.count }
+        ackIndex = cueIndex
+        let cue = ackCues[cueIndex]
         ackTimer = Timer.scheduledTimer(withTimeInterval: ackDelay, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             self.ackTimer = nil
@@ -709,7 +733,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
             case "RESULT":
                 self.ackTimer?.invalidate(); self.ackTimer = nil
                 self.gotResult = true
-                for s in self.splitSentences(text) { self.enqueueSpeech(s) }
+                // Stream the final reply gaplessly via /tts_stream. If the ack or some
+                // narration is still playing, hold it and start the stream the moment
+                // the batch queue drains (see playNextInQueue).
+                if self.isSpeaking || !self.speechQueue.isEmpty {
+                    self.pendingResult = text
+                } else {
+                    self.startResultStream(text)
+                }
             default:
                 break                                        // SID and anything else: ignore
             }
@@ -724,7 +755,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
             flash(.error, error: "No response from Claude.")
             return
         }
-        if !isSpeaking && speechQueue.isEmpty { finishResponse() }
+        // Don't wrap up if a streamed reply is still playing or queued to start.
+        if !isSpeaking && speechQueue.isEmpty && !streaming && pendingResult == nil { finishResponse() }
     }
 
     private func finishResponse() {
@@ -745,6 +777,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         speechQueue.removeAll()
         lastEnqueued = ""
         isSpeaking = false
+        // Tear down any in-flight streamed reply.
+        streaming = false
+        streamPlaying = false
+        streamEOF = false
+        gotStreamAudio = false
+        streamChunks.removeAll()
+        streamBuffer.removeAll()
+        streamText = ""
+        pendingResult = nil
+        streamNextPlayer?.stop(); streamNextPlayer = nil
+        streamTask?.cancel(); streamTask = nil
+        streamSession?.invalidateAndCancel(); streamSession = nil
         synth.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
         audioPlayer = nil
@@ -776,6 +820,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private func playNextInQueue() {
         guard !speechQueue.isEmpty else {
             isSpeaking = false
+            if let r = pendingResult {                         // narration done → stream the answer
+                pendingResult = nil
+                startResultStream(r)
+                return
+            }
             if !agentRunning { finishResponse() }             // all said and agent done
             return                                            // else keep the orb green, await more
         }
@@ -806,17 +855,144 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         playNextInQueue()
     }
 
-    /// Split a final answer into sentence-sized pieces so each plays as soon as it's
-    /// synthesized — client-side streaming of the reply, mirroring the server's split.
-    private func splitSentences(_ text: String) -> [String] {
-        let clean = text.replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return [] }
-        var out: [String] = []
-        clean.enumerateSubstrings(in: clean.startIndex..<clean.endIndex, options: .bySentences) { sub, _, _, _ in
-            if let s = sub?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { out.append(s) }
+    // MARK: Streamed reply (/tts_stream)
+    //
+    // Fetch the final answer as length-framed WAV chunks and play them gaplessly as
+    // they arrive. The HUD karaoke runs off an estimated total duration (we don't know
+    // the real one until every frame lands); the rolling 10-word window self-corrects.
+
+    /// Begin streaming + playing the final reply. Falls back to the system voice if the
+    /// server never sends any audio (down / errored).
+    private func startResultStream(_ text: String) {
+        synth.stopSpeaking(at: .immediate)
+        audioPlayer?.stop(); audioPlayer = nil
+        karaokeTimer?.invalidate()
+        streaming = true
+        streamPlaying = false
+        streamEOF = false
+        gotStreamAudio = false
+        streamChunks.removeAll()
+        streamBuffer.removeAll()
+        streamNextPlayer = nil
+        streamText = text
+        streamTask?.cancel()
+        streamSession?.invalidateAndCancel(); streamSession = nil   // belt-and-suspenders
+        state.phase = .done                                   // green "speaking" orb
+        startKaraoke(text: text, duration: estimatedSpeechDuration(text))
+
+        guard let body = try? JSONSerialization.data(withJSONObject: ["text": text]) else {
+            streaming = false; speakSystem(text); return
         }
-        return out.isEmpty ? [clean] : out
+        var req = URLRequest(url: ttsStreamURL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        req.timeoutInterval = 300
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        streamSession = session
+        let dataTask = session.dataTask(with: req)
+        streamTask = dataTask
+        dataTask.resume()
+    }
+
+    /// Pull complete `[4-byte length][WAV]` frames out of the receive buffer; start /
+    /// keep playback fed as each one lands.
+    private func drainStreamFrames() {
+        while true {
+            guard streamBuffer.count >= 4 else { break }
+            let s = streamBuffer.startIndex
+            let len = (Int(streamBuffer[s]) << 24) | (Int(streamBuffer[s + 1]) << 16)
+                    | (Int(streamBuffer[s + 2]) << 8) | Int(streamBuffer[s + 3])
+            if len <= 0 || len > 50_000_000 {                 // corrupt frame → stop parsing
+                streamBuffer.removeAll(); break
+            }
+            guard streamBuffer.count >= 4 + len else { break } // wait for the rest of the frame
+            let wav = streamBuffer.subdata(in: (s + 4)..<(s + 4 + len))
+            streamBuffer.removeSubrange(s..<(s + 4 + len))
+            streamChunks.append(wav)
+            gotStreamAudio = true
+            if !streamPlaying { playNextStreamChunk() } else { prepareNextStreamChunk() }
+        }
+    }
+
+    /// Play the next streamed chunk (using the pre-prepared player when available so the
+    /// transition is seamless), and prepare the one after it.
+    private func playNextStreamChunk() {
+        guard streaming else { return }
+        var player = streamNextPlayer
+        streamNextPlayer = nil
+        while player == nil, !streamChunks.isEmpty {           // build from the raw queue, skipping bad frames
+            player = makeStreamPlayer(streamChunks.removeFirst())
+        }
+        guard let p = player else {                            // nothing ready right now
+            streamPlaying = false
+            if streamEOF { finishStreamResult() }              // genuinely done
+            return                                             // else underrun: wait for the next frame
+        }
+        streamPlaying = true
+        audioPlayer = p
+        p.play()
+        prepareNextStreamChunk()
+    }
+
+    /// Pre-build the following chunk's player so it can start the instant this one ends.
+    private func prepareNextStreamChunk() {
+        guard streamNextPlayer == nil else { return }
+        while !streamChunks.isEmpty {
+            if let p = makeStreamPlayer(streamChunks.removeFirst()) { streamNextPlayer = p; return }
+        }
+    }
+
+    private func makeStreamPlayer(_ data: Data) -> AVAudioPlayer? {
+        guard let p = try? AVAudioPlayer(data: data) else { return nil }
+        p.delegate = self
+        p.prepareToPlay()
+        return p
+    }
+
+    /// The streamed reply finished playing — tear down and wrap up.
+    private func finishStreamResult() {
+        streaming = false
+        streamPlaying = false
+        streamNextPlayer = nil
+        streamChunks.removeAll()
+        streamBuffer.removeAll()
+        streamTask = nil
+        streamSession?.finishTasksAndInvalidate(); streamSession = nil
+        karaokeTimer?.invalidate()
+        state.stream = ""
+        if !agentRunning { finishResponse() }
+    }
+
+    /// Rough spoken-duration estimate (~0.072 s/char on this voice) to pace the HUD
+    /// before the true total is known.
+    private func estimatedSpeechDuration(_ text: String) -> TimeInterval {
+        max(1.0, Double(text.count) * 0.072 + 0.3)
+    }
+
+    // URLSession streaming callbacks (delegateQueue is a background queue → hop to main).
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        DispatchQueue.main.async {
+            guard self.streaming, dataTask === self.streamTask else { return }
+            self.streamBuffer.append(data)
+            self.drainStreamFrames()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        DispatchQueue.main.async {
+            guard self.streaming, task === self.streamTask else { return }
+            self.drainStreamFrames()
+            self.streamEOF = true
+            if !self.gotStreamAudio {                          // server unreachable / empty → Apple voice
+                self.streaming = false
+                self.streamTask = nil
+                self.streamSession?.finishTasksAndInvalidate(); self.streamSession = nil
+                self.speakSystem(self.streamText)
+                return
+            }
+            if !self.streamPlaying && self.streamChunks.isEmpty { self.finishStreamResult() }
+        }
     }
 
     /// Ask the Chatterbox server for speech audio; nil on any failure (→ fallback).
@@ -873,7 +1049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        segmentFinished()
+        if streaming { playNextStreamChunk() } else { segmentFinished() }
     }
 
     /// Apple's on-device synthesizer — fallback when the neural server isn't ready.

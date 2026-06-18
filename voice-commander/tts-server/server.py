@@ -43,11 +43,14 @@ MODEL_KIND = os.environ.get("TTS_MODEL", "turbo").strip().lower()
 # sentence boundaries get real pauses. Both are tunable via env.
 MAX_CHUNK = int(os.environ.get("TTS_MAX_CHUNK", "240"))
 GAP_MS = int(os.environ.get("TTS_GAP_MS", "300"))
-# Streaming uses smaller per-sentence chunks than the batch path so synthesis keeps
-# pace with playback (fewer/no gaps after the first word). 90 was measured as the
-# sweet spot on M3 Pro: ~2.4s to first word, ~0.75s total gap, then gapless (synth
-# stays >1x real-time so it never falls behind, even on long replies). Tunable via env.
-STREAM_MAX_CHUNK = int(os.environ.get("TTS_STREAM_MAX_CHUNK", "90"))
+# Streaming chunking builds a small synthesis "lead" so playback never underruns
+# (no mid-stream catches). Two levers: the FIRST chunk is packed a bit larger so its
+# playback covers the synth time of the *next* chunk — synth runs ~1.3x real-time once
+# going, so after that first hand-off it stays ahead and never falls behind; BODY
+# chunks are smaller + uniform to hold that lead. Measured on M3 Pro: first word ~3-4s,
+# then gapless on replies of any length. Both tunable via env.
+STREAM_BODY = int(os.environ.get("TTS_STREAM_CHUNK", "60"))    # body chunk target chars
+STREAM_FIRST = int(os.environ.get("TTS_STREAM_FIRST", "95"))   # first chunk max chars (the lead)
 
 
 def pick_device() -> str:
@@ -100,19 +103,29 @@ def to_wav_bytes(wav, sr: int) -> bytes:
 
 
 def _sentences(text: str, max_chunk: int) -> list:
-    """Split text into sentences, hard-splitting any sentence longer than max_chunk
-    on a comma (or length as a last resort) so no single piece is huge."""
+    """Split text into sentences, hard-splitting any sentence longer than max_chunk on
+    a comma, else on a word boundary (a space) — NEVER inside a word. (The old code fell
+    back to cutting at the raw character offset, which sliced words in half, e.g.
+    "nations" -> "nat" + "ions".) A single token longer than max_chunk is kept whole:
+    correct speech beats a tidy chunk size."""
     text = re.sub(r"\s+", " ", text.strip())
     if not text:
         return []
     out: list = []
     for s in (p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()):
         while len(s) > max_chunk:
-            cut = s.rfind(",", 0, max_chunk)
-            if cut < max_chunk // 2:
-                cut = max_chunk
-            out.append(s[:cut].strip())
-            s = s[cut:].strip()
+            ci = s.rfind(",", 0, max_chunk)          # prefer to break right after a comma
+            if ci >= max_chunk // 2:
+                head, s = s[:ci + 1], s[ci + 1:]
+            else:
+                wi = s.rfind(" ", 0, max_chunk)      # else break at the last word boundary
+                if wi <= 0:                          # one token longer than the window → keep whole
+                    nxt = s.find(" ", max_chunk)
+                    wi = nxt if nxt != -1 else len(s)
+                head, s = s[:wi], s[wi:]
+            head, s = head.strip(), s.strip()
+            if head:
+                out.append(head)
         if s:
             out.append(s)
     return out
@@ -141,13 +154,30 @@ def split_text(text: str, max_chunk: int = MAX_CHUNK) -> list:
     return _pack(_sentences(text, max_chunk), max_chunk)
 
 
-def split_stream(text: str, max_chunk: int = STREAM_MAX_CHUNK) -> list:
-    """Streaming chunking: small per-sentence chunks (long sentences hard-split on
-    commas to <= max_chunk). Kept deliberately short and uniform so that, with synth
-    running near real-time, each chunk finishes before the previous one stops
-    playing — first word in ~2-3s AND minimal gaps after it. Packing sentences into
-    big chunks (as the batch path does) reintroduces the stall we're avoiding."""
-    return _sentences(text, max_chunk)
+def split_stream(text: str, body: int = STREAM_BODY, first: int = STREAM_FIRST) -> list:
+    """Streaming chunking: a slightly larger FIRST chunk (so its playback covers the
+    next chunk's synth time → builds a lead and the stream never underruns) followed by
+    small, uniform BODY chunks that hold that lead. Long sentences are hard-split on
+    commas to <= body so no single piece is huge. This kills the chunk0→chunk1 catch
+    that pure per-sentence splitting hit when the opening sentence was short."""
+    pieces = _sentences(text, body)
+    if not pieces:
+        return []
+    chunks: list = []
+    cur = ""
+    target = first                       # first chunk gets the larger target …
+    for p in pieces:
+        if not cur:
+            cur = p
+        elif len(cur) + 1 + len(p) <= target:
+            cur += " " + p
+        else:
+            chunks.append(cur)
+            cur = p
+            target = body                # … every chunk after the first uses the body target
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def synth_segments(text: str, exaggeration: float, cfg_weight: float, stream: bool = False):
