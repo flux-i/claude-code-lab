@@ -15,6 +15,10 @@ ClaudeVoice.app  ─→  ~/.claude/voice/voice-agent.sh      →  claude -p     
 - **`tts-server/`** — neural text-to-speech via Resemble AI's **Chatterbox** (local HTTP server, Python venv). The app POSTs the reply text and plays the returned WAV. See "Text-to-speech" below.
 - **`stt-server/`** — speech-to-text via **whisper.cpp** (`large-v3-turbo`, local HTTP server, no Python — the prebuilt `whisper-server` binary *is* the server). The app POSTs the recorded WAV and uses the returned transcript. See "Speech-to-text" below.
 
+### Startup launcher (servers run only while the app is open)
+
+The app opens to a **startup window** (`LauncherView` in `main.swift`) — it does **not** auto-start the servers anymore. Flow: **Start** → launches the TTS + STT servers and polls them (`pollLauncherHealth`) showing per-server *Starting…/Ready* → once both are healthy the button becomes **Enter ClaudeVoice** → that switches the app from `.regular` to `.accessory` (menu-bar mode) and the push-to-talk hotkey goes live (gated on `didProceed`). The servers are **owned by the app**: ones it launched are kept as `ttsProc`/`sttProc`, and a server already listening at Start (warm leftover) is **adopted** by PID (`pidListening` via `lsof`) into `adoptedPIDs`. `applicationWillTerminate` → `stopServers()` SIGTERMs all of them, so **quitting ClaudeVoice stops the servers** — nothing lingers in the background. (`run.sh` `exec`s the server, so the Process PID *is* the server and SIGTERM reaches it directly.) `--demo` skips the launcher (goes straight to accessory mode).
+
 ### Speech-to-text (Whisper primary, Apple fallback — hybrid)
 
 Push-to-talk audio is transcribed by **Whisper** (`whisper.cpp`, `large-v3-turbo`) running
@@ -33,8 +37,10 @@ longer clips. How the two engines combine (`main.swift`):
   the 2 s silence timeout). The per-turn route is `usingWhisper`, decided from a cached `sttUp`.
 - **Liveness:** `whisper-server` has no `/health`; once the port answers, the model is already
   loaded. `pollSTTHealth()` refreshes the cached `sttUp` every 3 s so key-down has zero
-  health-check latency. The app auto-launches the server at startup (`ensureSTTServer()`), same
-  as the TTS one; first launch loads the model (~10-20s) and until then commands use Apple.
+  health-check latency. The server is launched from the **startup launcher's Start button**
+  (`ensureSTTServer()`), same as the TTS one; first launch loads the model (~10-20s) and the
+  launcher shows *Starting…* until the port answers (and once in use, commands fall back to Apple
+  if the server isn't up).
 - **Barge-in:** the Whisper POST completion is guarded on `runID` (like the TTS path), so a
   superseded turn's transcript is dropped.
 
@@ -50,7 +56,7 @@ The reply is spoken with **Chatterbox** — an expressive open-source neural voi
   - `POST /tts` ({"text"} → one WAV) — **batch**: synthesizes the whole reply, then returns it. First audio only after the *entire* reply renders (~22s on a long one). Used for short **narration** segments (SAY/TOOL/ALERT, the "On it…" ack), which are single lines.
   - `POST /tts_stream` ({"text"} → length-framed WAVs) — **streaming**: emits one `[4-byte big-endian length][WAV]` frame per chunk the instant it's ready, so playback starts in ~3-5s regardless of reply length. **This is what the app uses for the final answer** (`startResultStream` in `main.swift`). See "Streaming" below.
 - The voice **conditioning is prepared once at startup** (cached `MODEL.conds`), not re-encoded per chunk — `synth_segments()` is the shared per-chunk generator both endpoints build on.
-- The app **auto-launches** the server at startup (`ensureTTSServer()`) if `~/.claude/voice/tts-server/run.sh` exists and nothing is listening. First launch loads the model (~10-20s after weights are cached).
+- The server is launched from the **startup launcher's Start button** (`ensureTTSServer()`) if `~/.claude/voice/tts-server/run.sh` exists and nothing is listening. First launch loads the model (~10-20s after weights are cached; a cold load can be longer — the launcher waits on `/health` before showing *Ready*).
 - `speak()` POSTs the text, plays the WAV via `AVAudioPlayer`, and drives the HUD karaoke window off the clip's duration (a `Timer`, since neural audio has no `willSpeakRangeOfSpeechString` callbacks).
 - **Fallback:** if the server isn't reachable (still loading, not installed), `speak()` silently falls back to `speakSystem()` (Apple `AVSpeechSynthesizer`). The app always speaks *something*.
 

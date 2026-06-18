@@ -210,9 +210,178 @@ final class HUDController {
     }
 }
 
+// MARK: - Launcher (startup window) ──────────────────────────────────────────
+//
+// Shown when the app is opened. The servers are NOT running until the user clicks
+// Start; once both report healthy, "Enter ClaudeVoice" drops the app into its
+// menu-bar background mode. The servers are owned by the app (see AppDelegate) and
+// torn down on quit — they only run while ClaudeVoice is open.
+
+enum ServerStatus { case stopped, starting, ready, failed }
+enum LauncherPhase { case idle, starting, ready }
+
+final class LauncherState: ObservableObject {
+    @Published var phase: LauncherPhase = .idle
+    @Published var tts: ServerStatus = .stopped
+    @Published var stt: ServerStatus = .stopped
+    var onStart: () -> Void = {}
+    var onProceed: () -> Void = {}
+}
+
+/// A small status light: dim when idle, amber+pulsing while starting, green ready, rose failed.
+private struct StatusDot: View {
+    let status: ServerStatus
+    @State private var pulse = false
+    private var color: Color {
+        switch status {
+        case .stopped:  return Color.white.opacity(0.22)
+        case .starting: return Color(red: 1.00, green: 0.80, blue: 0.42)
+        case .ready:    return Color(red: 0.50, green: 0.95, blue: 0.70)
+        case .failed:   return Color(red: 1.00, green: 0.56, blue: 0.56)
+        }
+    }
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 9, height: 9)
+            .shadow(color: color.opacity(status == .stopped ? 0 : 0.8), radius: 5)
+            .opacity(status == .starting && pulse ? 0.30 : 1.0)
+            .animation(status == .starting
+                       ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true)
+                       : .default, value: pulse)
+            .onAppear { pulse = true }
+    }
+}
+
+private struct ServerRow: View {
+    let title: String
+    let detail: String
+    let status: ServerStatus
+    private var statusText: String {
+        switch status {
+        case .stopped:  return "Not started"
+        case .starting: return "Starting…"
+        case .ready:    return "Ready"
+        case .failed:   return "Unavailable"
+        }
+    }
+    var body: some View {
+        HStack(spacing: 12) {
+            StatusDot(status: status)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                Text(detail)
+                    .font(.system(size: 11, weight: .light))
+                    .foregroundStyle(.white.opacity(0.34))
+            }
+            Spacer(minLength: 8)
+            Text(statusText)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(status == .ready ? 0.70 : 0.40))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 1))
+    }
+}
+
+private struct LauncherView: View {
+    @EnvironmentObject var launcher: LauncherState
+
+    private var orbPhase: Phase {
+        switch launcher.phase {
+        case .idle:     return .listening   // cool moonlight
+        case .starting: return .thinking    // soft violet
+        case .ready:    return .done         // pale aurora green
+        }
+    }
+    private var buttonTitle: String {
+        switch launcher.phase {
+        case .idle:     return "Start"
+        case .starting: return "Starting servers…"
+        case .ready:    return "Enter ClaudeVoice"
+        }
+    }
+    private var buttonFill: Color {
+        switch launcher.phase {
+        case .idle:     return Color.white.opacity(0.12)
+        case .starting: return Color.white.opacity(0.06)
+        case .ready:    return glow(for: .done)
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.spaceBlack.ignoresSafeArea()
+            Starfield().ignoresSafeArea()
+            RadialGradient(colors: [glow(for: orbPhase).opacity(0.14), .clear],
+                           center: .top, startRadius: 4, endRadius: 360)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                Orb(phase: orbPhase, diameter: 52)
+                    .frame(height: 84)
+                    .padding(.top, 34)
+
+                Text("ClaudeVoice")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.top, 4)
+                Text("Hold Right ⌘ and speak")
+                    .font(.system(size: 12, weight: .light))
+                    .foregroundStyle(.white.opacity(0.34))
+                    .padding(.top, 3)
+
+                VStack(spacing: 10) {
+                    ServerRow(title: "Neural voice", detail: "Chatterbox text-to-speech", status: launcher.tts)
+                    ServerRow(title: "Speech recognition", detail: "Whisper transcription", status: launcher.stt)
+                }
+                .padding(.horizontal, 26)
+                .padding(.top, 26)
+
+                Spacer(minLength: 18)
+
+                Button(action: {
+                    switch launcher.phase {
+                    case .idle:     launcher.onStart()
+                    case .ready:    launcher.onProceed()
+                    case .starting: break
+                    }
+                }) {
+                    HStack(spacing: 8) {
+                        if launcher.phase == .starting {
+                            ProgressView().controlSize(.small).tint(.white)
+                        }
+                        Text(buttonTitle)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                    .foregroundStyle(launcher.phase == .ready ? Color.spaceBlack : Color.white.opacity(0.92))
+                    .background(Capsule().fill(buttonFill))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(launcher.phase == .starting)
+                .padding(.horizontal, 26)
+
+                Text("Servers run only while ClaudeVoice is open.")
+                    .font(.system(size: 10, weight: .light))
+                    .foregroundStyle(.white.opacity(0.26))
+                    .padding(.top, 12)
+                    .padding(.bottom, 20)
+            }
+        }
+        .frame(width: 420, height: 480)
+    }
+}
+
 // MARK: - App delegate ────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate, URLSessionDataDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate, URLSessionDataDelegate, NSWindowDelegate {
 
     // Config
     private let triggerKeyCode: UInt16 = 54 // Right Command
@@ -248,6 +417,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var axMenuItem: NSMenuItem!
     private let state = AppState()
     private var hud: HUDController!
+
+    // Launcher / server lifecycle
+    //  The app opens to a startup window (LauncherView). Servers are launched only
+    //  when the user clicks Start, and are OWNED here (ttsProc/sttProc) so they can be
+    //  torn down on quit — nothing runs in the background once ClaudeVoice closes.
+    //  `didProceed` flips true when the user enters the menu-bar mode; until then the
+    //  push-to-talk hotkey is inert.
+    private let launcherState = LauncherState()
+    private var launcherWindow: NSWindow?
+    private var didProceed = false
+    private var ttsProc: Process?              // TTS server we launched (terminated on quit)
+    private var sttProc: Process?              // STT server we launched (terminated on quit)
+    private var adoptedPIDs: [Int32] = []      // already-up servers we took over at Start (also killed on quit)
 
     // Speech
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -321,7 +503,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
         hud = HUDController(state: state)
         synth.delegate = self
 
@@ -329,11 +510,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         requestPermissions()
         installHotkeyMonitors()
         refreshAccessibilityState()
-        ensureTTSServer()
-        ensureSTTServer()
         pollSTTHealth()
 
-        if CommandLine.arguments.contains("--demo") { runDemo() }
+        if CommandLine.arguments.contains("--demo") {
+            NSApp.setActivationPolicy(.accessory)
+            didProceed = true
+            runDemo()
+            return
+        }
+
+        // Open to the startup window. Servers are NOT auto-started — the user clicks
+        // Start, waits for both to come up, then "Enter ClaudeVoice", which switches to
+        // the menu-bar background mode (today's behavior from there on).
+        NSApp.setActivationPolicy(.regular)
+        launcherState.onStart   = { [weak self] in self?.startServers() }
+        launcherState.onProceed = { [weak self] in self?.proceedToBackground() }
+        showLauncher()
     }
 
     /// Visual smoke-test: listening → thinking → speaking (streamed), then fades.
@@ -354,6 +546,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     func applicationWillTerminate(_ notification: Notification) {
         if let g = globalMonitor { NSEvent.removeMonitor(g) }
         if let l = localMonitor { NSEvent.removeMonitor(l) }
+        stopServers()
+    }
+
+    /// Stop every server this app is responsible for — the ones we launched (run.sh
+    /// `exec`s the server, so the Process PID is the server itself, and SIGTERM reaches
+    /// it directly) and any that were already listening when the user clicked Start and
+    /// we adopted. Called on quit so nothing keeps running once ClaudeVoice closes.
+    private func stopServers() {
+        ttsProc?.terminate(); ttsProc = nil
+        sttProc?.terminate(); sttProc = nil
+        for pid in adoptedPIDs { kill(pid, SIGTERM) }
+        adoptedPIDs.removeAll()
+    }
+
+    /// PID of whatever is LISTENing on a local TCP port (via lsof), or nil. Used to adopt
+    /// a warm server that's already up at Start so quit can still stop it.
+    private func pidListening(onPort port: Int) -> Int32? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        p.arguments = ["-ti", "tcp:\(port)", "-sTCP:LISTEN"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        let first = out.split(whereSeparator: { $0 == "\n" }).first.map(String.init)
+        return first.flatMap { Int32($0) }
+    }
+
+    // MARK: Launcher lifecycle
+    /// Build and show the startup window (a real .regular window with a dock icon).
+    private func showLauncher() {
+        let host = NSHostingView(rootView: LauncherView().environmentObject(launcherState))
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
+                         styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "ClaudeVoice"
+        w.titleVisibility = .hidden
+        w.titlebarAppearsTransparent = true
+        w.isMovableByWindowBackground = true
+        w.backgroundColor = NSColor(red: 0.024, green: 0.027, blue: 0.043, alpha: 1)
+        w.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        w.standardWindowButton(.zoomButton)?.isHidden = true
+        w.isReleasedWhenClosed = false
+        w.contentView = host
+        w.delegate = self
+        w.center()
+        launcherWindow = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    /// Start button: boot the servers we have installed, then poll them to ready.
+    private func startServers() {
+        launcherState.phase = .starting
+        launcherState.tts = FileManager.default.fileExists(atPath: ttsRunScript) ? .starting : .failed
+        launcherState.stt = FileManager.default.fileExists(atPath: sttRunScript) ? .starting : .failed
+        if launcherState.tts == .starting { ensureTTSServer() }
+        if launcherState.stt == .starting { ensureSTTServer() }
+        pollLauncherHealth()
+    }
+
+    /// Poll both servers ~every 1.2s, flipping each starting→ready as it answers. When
+    /// none are still starting (all ready or unavailable) the launcher offers "Enter".
+    private func pollLauncherHealth() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let ttsUp = self.isTTSUp()
+            let sttUp = self.isSTTUp()
+            DispatchQueue.main.async {
+                if self.didProceed { return }
+                if self.launcherState.tts == .starting && ttsUp { self.launcherState.tts = .ready }
+                if self.launcherState.stt == .starting && sttUp { self.launcherState.stt = .ready }
+                let stillStarting = self.launcherState.tts == .starting || self.launcherState.stt == .starting
+                if stillStarting {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.pollLauncherHealth() }
+                } else {
+                    self.launcherState.phase = .ready
+                }
+            }
+        }
+    }
+
+    /// Enter button: leave the startup window for the menu-bar background mode.
+    private func proceedToBackground() {
+        didProceed = true
+        NSApp.setActivationPolicy(.accessory)
+        guard let w = launcherWindow else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.3
+            w.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            w.orderOut(nil)
+            self?.launcherWindow = nil
+        })
+    }
+
+    /// Closing the startup window before entering quits the app (and kills the servers).
+    func windowWillClose(_ notification: Notification) {
+        if !didProceed { NSApp.terminate(nil) }
     }
 
     // MARK: Menu
@@ -439,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
 
     // MARK: Recording
     private func startRecording() {
+        guard didProceed else { return }   // hotkey is inert until the user enters from the launcher
         guard !isRecording else { return }
         // Barge-in: pressing the key mid-response (thinking or speaking) cancels it and
         // starts a fresh listen. The new command runs once you release the key.
@@ -1066,7 +1361,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private func ensureTTSServer() {
         guard FileManager.default.fileExists(atPath: ttsRunScript) else { return }  // not installed yet
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self = self, !self.isTTSUp() else { return }
+            guard let self = self else { return }
+            if self.isTTSUp() {   // a warm server (e.g. leftover from a prior run) — adopt it so quit stops it
+                if let pid = self.pidListening(onPort: self.ttsPort) {
+                    DispatchQueue.main.async { self.adoptedPIDs.append(pid) }
+                }
+                return
+            }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/zsh")
             p.arguments = [self.ttsRunScript]
@@ -1077,6 +1378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
                 p.standardError = fh
             }
             try? p.run()   // detached; first launch loads the model (~10-20s)
+            self.ttsProc = p   // own it so applicationWillTerminate can tear it down
         }
     }
 
@@ -1099,7 +1401,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private func ensureSTTServer() {
         guard FileManager.default.fileExists(atPath: sttRunScript) else { return }  // not installed yet
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self = self, !self.isSTTUp() else { return }
+            guard let self = self else { return }
+            if self.isSTTUp() {   // a warm server (e.g. leftover from a prior run) — adopt it so quit stops it
+                if let pid = self.pidListening(onPort: self.sttPort) {
+                    DispatchQueue.main.async { self.adoptedPIDs.append(pid) }
+                }
+                return
+            }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/zsh")
             p.arguments = [self.sttRunScript]
@@ -1110,6 +1418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
                 p.standardError = fh
             }
             try? p.run()   // detached; first launch loads the model (~10-20s)
+            self.sttProc = p   // own it so applicationWillTerminate can tear it down
         }
     }
 
