@@ -50,7 +50,10 @@ HARD_MAX_CTX=800000   # 800k — never resume beyond this; force fresh and annou
 ALERT_CTX=400000      # 400k — warn (once) that the conversation is getting large
 OLD_OK_CTX=110000     # 100k (+10k): a session this small resumes even if >1h old
 
-emit() { print -r -- "$1"$'\t'"$2"; }   # one protocol line (real tab delimiter)
+emit() {                                  # one protocol line (real tab delimiter)
+  print -r -- "$1"$'\t'"$2"
+  [[ "$STREAM" == "1" ]] && print -r -- "$(date '+%H:%M:%S')  $1  $2" >> "$LOG_DIR/protocol.log"
+}
 
 # ---- voice command: start a new conversation on demand ----------------------
 if [[ "${PROMPT:l}" =~ '(new|fresh) (conversation|chat)|start (over|fresh)|reset( the)? (conversation|chat)' ]]; then
@@ -115,24 +118,10 @@ elif (( forced_reset == 1 )); then
   alerted=0
 fi
 
-SYS="You are a friendly voice assistant. Your replies are read aloud, so keep them concise and conversational. Do not use markdown, code blocks, bullet lists, file paths, or emojis unless explicitly asked. After doing something, confirm briefly in one or two sentences."
+SYS="You are a friendly voice assistant. Your replies are read aloud, so keep them concise and conversational. Do not use markdown, code blocks, bullet lists, file paths, or emojis unless explicitly asked. After doing something, confirm briefly in one or two sentences. Do NOT add greetings or sign-offs (no \"talk to you later\", \"let me know\", etc.) — just answer."
 if [[ "$STREAM" == "1" ]]; then
-  SYS="$SYS As you work, narrate progress: before each tool call or step, say ONE short, natural spoken sentence describing what you're about to do (for example, \"Let me check the logs.\"). Keep each to a single sentence. Your FINAL message must contain only the answer itself, with no narration."
+  SYS="$SYS If a task takes several steps, you MAY occasionally say one short progress note at the start of a significant step — only when it genuinely tells the user something useful. Never narrate routine or repeated commands, never restate your answer in a note, and keep notes rare; most requests need none at all. Your final message is only the answer."
 fi
-
-# Map a tool name to a short spoken fallback phrase (empty = stay silent for it).
-tool_phrase() {
-  case "$1" in
-    Bash)                print -r -- "Running a command." ;;
-    Read)                print -r -- "Reading a file." ;;
-    Grep|Glob)           print -r -- "Searching the code." ;;
-    Edit|Write|MultiEdit) print -r -- "Making a change." ;;
-    WebFetch|WebSearch)  print -r -- "Looking that up." ;;
-    Task|Agent)          print -r -- "Bringing in a helper." ;;
-    mcp__*)              print -r -- "Checking an external tool." ;;
-    *)                   print -r -- "" ;;   # TodoWrite, etc. — no narration
-  esac
-}
 
 # jq: transform Claude's stream-json events into our line protocol. An assistant
 # message that ALSO calls a tool has interstitial narration text (speak it); a
@@ -157,8 +146,8 @@ run_stream() {  # consume events; fill result/sid_seen; emit SAY/TOOL live (stre
   while IFS=$'\t' read -r tag rest; do
     case "$tag" in
       SID)    [[ -n "$rest" ]] && sid_seen="$rest" ;;
-      SAY)    emit SAY "$rest" ;;
-      TOOL)   ph=$(tool_phrase "$rest"); [[ -n "$ph" ]] && emit TOOL "$ph" ;;
+      SAY)    emit SAY "$rest" ;;     # only the model's OWN narration is spoken
+      TOOL)   : ;;                    # tool-phrase fallback removed — too repetitive ("running a command…")
       RESULT) result="$rest" ;;
     esac
   done < <( "$CLAUDE" -p "$PROMPT" "$@" \

@@ -260,6 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var agentRunning = false          // the agent process is still producing output
     private var gotResult = false             // a RESULT line arrived this turn
     private var runID = 0                     // bumped each turn; stale callbacks are dropped
+    private var lastEnqueued = ""             // de-dupe: skip a segment identical to the previous
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -474,7 +475,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         gotResult = false
         speechQueue.removeAll()
         isSpeaking = false
-        enqueueSpeech("On it.")        // instant ack — the first model narration can be ~10s out
+        lastEnqueued = ""
+        // No canned ack — the violet "thinking" orb is the cue; we speak only the
+        // model's own narration (if any) and then the answer.
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -572,6 +575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         agentProc = nil
         agentRunning = false
         speechQueue.removeAll()
+        lastEnqueued = ""
         isSpeaking = false
         synth.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
@@ -588,13 +592,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     /// One-off speak (menu actions, demo): replace anything in flight with this.
     private func speak(_ text: String) {
         cancelCurrentOperation()
+        hud.show()
         enqueueSpeech(text)
     }
 
     /// Queue a segment; start playing if nothing is currently speaking.
     private func enqueueSpeech(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
+        guard !t.isEmpty, t != lastEnqueued else { return }   // skip empties + consecutive repeats
+        lastEnqueued = t
         speechQueue.append(t)
         if !isSpeaking { playNextInQueue() }
     }
@@ -602,13 +608,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private func playNextInQueue() {
         guard !speechQueue.isEmpty else {
             isSpeaking = false
-            if agentRunning { state.phase = .thinking }   // violet while waiting for more
-            else { finishResponse() }                     // all said and agent done
-            return
+            if !agentRunning { finishResponse() }             // all said and agent done
+            return                                            // else keep the orb green, await more
         }
         isSpeaking = true
-        state.phase = .done                               // green "speaking" orb
-        hud.show()
+        state.phase = .done                                   // green "speaking" orb — stays green
         speakSegment(speechQueue.removeFirst())
     }
 
