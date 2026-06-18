@@ -212,7 +212,7 @@ final class HUDController {
 
 // MARK: - App delegate ────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
 
     // Config
     private let triggerKeyCode: UInt16 = 54 // Right Command
@@ -221,7 +221,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private let logDir = ("~/.claude/voice/logs" as NSString).expandingTildeInPath
 
     // Text-to-speech
+    //  Primary: neural Chatterbox voice from a local server (see tts-server/).
+    //  Fallback: Apple's AVSpeechSynthesizer if the server isn't up yet.
     private let synth = AVSpeechSynthesizer()
+    private let ttsPort = 8765
+    private let ttsRunScript = ("~/.claude/voice/tts-server/run.sh" as NSString).expandingTildeInPath
+    private var ttsURL: URL { URL(string: "http://127.0.0.1:\(ttsPort)/tts")! }
+    private var ttsHealthURL: URL { URL(string: "http://127.0.0.1:\(ttsPort)/health")! }
+    private var audioPlayer: AVAudioPlayer?
+    private var karaokeTimer: Timer?
 
     // UI
     private var statusItem: NSStatusItem!
@@ -254,6 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         requestPermissions()
         installHotkeyMonitors()
         refreshAccessibilityState()
+        ensureTTSServer()
 
         if CommandLine.arguments.contains("--demo") { runDemo() }
     }
@@ -477,13 +486,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     }
 
     // MARK: Text-to-speech (Claude speaks its reply back, words streamed to the HUD)
+    //
+    // Primary path is the neural Chatterbox server: POST the text, play the returned
+    // WAV, and drive the karaoke window off the clip's duration. If the server isn't
+    // reachable (still loading, not installed), fall back to the system synthesizer.
     private func speak(_ text: String) {
-        synth.stopSpeaking(at: .immediate)
+        DispatchQueue.main.async {
+            self.synth.stopSpeaking(at: .immediate)
+            self.audioPlayer?.stop()
+            self.audioPlayer = nil
+            self.karaokeTimer?.invalidate()
+            self.state.stream = ""
+        }
+        requestNeuralSpeech(text) { [weak self] data in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if let data = data, self.playNeural(data, text: text) { return }
+                self.speakSystem(text)   // graceful fallback to Apple TTS
+            }
+        }
+    }
+
+    /// Ask the Chatterbox server for speech audio; nil on any failure (→ fallback).
+    private func requestNeuralSpeech(_ text: String, completion: @escaping (Data?) -> Void) {
+        guard let body = try? JSONSerialization.data(withJSONObject: ["text": text]) else {
+            completion(nil); return
+        }
+        var req = URLRequest(url: ttsURL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        req.timeoutInterval = 120          // synthesis of a long reply can take a few seconds
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            guard let data = data, !data.isEmpty,
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                completion(nil); return
+            }
+            completion(data)
+        }.resume()
+    }
+
+    /// Play neural WAV data and start the karaoke window. Returns false if it can't play.
+    private func playNeural(_ data: Data, text: String) -> Bool {
+        do {
+            let player = try AVAudioPlayer(data: data)
+            player.delegate = self
+            guard player.prepareToPlay() else { return false }
+            audioPlayer = player
+            player.play()
+            startKaraoke(text: text, duration: player.duration)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Approximate the AVSpeech "karaoke" sync: reveal words proportional to elapsed
+    /// playback so the HUD shows the last ~10 spoken words, then clears at the end.
+    private func startKaraoke(text: String, duration: TimeInterval) {
+        karaokeTimer?.invalidate()
+        let words = text.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+        guard !words.isEmpty, duration > 0 else { return }
+        let start = Date()
+        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            let frac = min(1.0, Date().timeIntervalSince(start) / duration)
+            let count = max(1, Int((frac * Double(words.count)).rounded(.up)))
+            let window = words.prefix(count).suffix(10).joined(separator: " ")
+            self.state.stream = window
+            if frac >= 1.0 { t.invalidate() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        karaokeTimer = timer
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        karaokeTimer?.invalidate()
+        hud.hide(after: 1.2)
+    }
+
+    /// Apple's on-device synthesizer — fallback when the neural server isn't ready.
+    private func speakSystem(_ text: String) {
         state.stream = ""
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = bestVoice()
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         synth.speak(utterance)
+    }
+
+    // MARK: Chatterbox server lifecycle
+    /// Launch the local TTS server at startup if it isn't already listening.
+    private func ensureTTSServer() {
+        guard FileManager.default.fileExists(atPath: ttsRunScript) else { return }  // not installed yet
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self, !self.isTTSUp() else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = [self.ttsRunScript]
+            let logPath = (self.logDir as NSString).appendingPathComponent("tts-server.log")
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+            if let fh = FileHandle(forWritingAtPath: logPath) {
+                p.standardOutput = fh
+                p.standardError = fh
+            }
+            try? p.run()   // detached; first launch loads the model (~10-20s)
+        }
+    }
+
+    /// Synchronous health check (called off the main thread).
+    private func isTTSUp() -> Bool {
+        var req = URLRequest(url: ttsHealthURL)
+        req.timeoutInterval = 0.6
+        let sem = DispatchSemaphore(value: 0)
+        var up = false
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            if let h = resp as? HTTPURLResponse, h.statusCode == 200 { up = true }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 1.0)
+        return up
     }
 
     /// Karaoke sync: as each range is spoken, show only the last ~10 spoken words.
