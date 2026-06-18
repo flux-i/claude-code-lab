@@ -1,0 +1,11 @@
+# OS / editor junk
+.DS_Store
+
+# Build artifacts
+**/build/
+*.app
+
+# Python runtime (the TTS venv lives in ~/.claude/voice, but guard against any local one)
+**/.venv/
+__pycache__/
+*.pyc

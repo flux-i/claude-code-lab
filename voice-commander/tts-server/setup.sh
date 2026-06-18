@@ -11,14 +11,10 @@ set -euo pipefail
 SRC="${0:A:h}"
 DEST="$HOME/.claude/voice/tts-server"
 
-echo "→ installing into $DEST"
-mkdir -p "$DEST"
-cp "$SRC/server.py" "$DEST/server.py"
-cp "$SRC/run.sh"    "$DEST/run.sh"
-chmod +x "$DEST/run.sh"
-# Voice reference (refined British female, public-domain LibriVox). run.sh clones it
-# via TTS_VOICE. Drop in a different reference.wav to change the voice.
-[[ -f "$SRC/reference.wav" ]] && cp "$SRC/reference.wav" "$DEST/reference.wav"
+# Install the code (symlinks server.py, copies run.sh + the voice reference). deploy.sh
+# is the single place that wires the repo into ~/.claude/voice.
+echo "→ installing code via deploy.sh"
+"$SRC/../deploy.sh"
 
 cd "$DEST"
 
