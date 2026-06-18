@@ -82,15 +82,21 @@ func composeValue(_ win: AXUIElement) -> String {
 }
 
 // Bring the user's previously-active app back to the front. Teams activates itself
-// ASYNCHRONOUSLY after a deep-link open, so one activate() loses the race — settle
-// briefly to let Teams finish, then re-activate in a short retry loop until it sticks.
+// ASYNCHRONOUSLY (and repeatedly) after a deep-link open, and on modern macOS a bare
+// activate() from a background CLI loses that race — so the user gets stranded in
+// Teams. Fix: after a gentle first try, HIDE Teams, which forces the OS to yield the
+// front to the previously-active app; then assert activation on it. Retry until it
+// sticks. If the user was already in Teams, leave it alone.
 func restoreFocus(_ app: NSRunningApplication?) {
     guard let app = app else { return }
-    usleep(450_000)                         // let Teams finish its own async activation
-    for _ in 0..<10 {
+    let teams = teamsApp()
+    if let t = teams, t.processIdentifier == app.processIdentifier { return }
+    usleep(450_000)                         // let Teams finish its own async self-activation
+    for attempt in 0..<14 {
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return }
+        if attempt >= 1 { teams?.hide() }   // hiding Teams reliably yields the front
         app.activate()
-        usleep(150_000)
+        usleep(160_000)
     }
 }
 
