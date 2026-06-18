@@ -17,10 +17,16 @@ ClaudeVoice.app  ─→  ~/.claude/voice/voice-agent.sh      →  claude -p     
 
 The reply is spoken with **Chatterbox** — an expressive open-source neural voice — not the robotic `AVSpeechSynthesizer`. How it fits together:
 
-- `tts-server/server.py` loads Chatterbox once (on MPS) and serves `GET /health` + `POST /tts` ({"text"} → WAV) on `127.0.0.1:8765`.
+- `tts-server/server.py` loads Chatterbox once (on MPS) and serves on `127.0.0.1:8765`:
+  - `GET /health` → `ok` once loaded.
+  - `POST /tts` ({"text"} → one WAV) — **batch**: synthesizes the whole reply, then returns it. First audio only after the *entire* reply renders (~22s on a long one). This is what the app currently uses.
+  - `POST /tts_stream` ({"text"} → length-framed WAVs) — **streaming**: emits one `[4-byte big-endian length][WAV]` frame per sentence chunk the instant it's ready, so playback starts in ~2.4s regardless of reply length. Built + proven via a CLI client; **not yet wired into the app** (that needs a `main.swift` change → rebuild → Accessibility re-grant). See "Streaming" below.
+- The voice **conditioning is prepared once at startup** (cached `MODEL.conds`), not re-encoded per chunk — `synth_segments()` is the shared per-chunk generator both endpoints build on.
 - The app **auto-launches** the server at startup (`ensureTTSServer()`) if `~/.claude/voice/tts-server/run.sh` exists and nothing is listening. First launch loads the model (~10-20s after weights are cached).
 - `speak()` POSTs the text, plays the WAV via `AVAudioPlayer`, and drives the HUD karaoke window off the clip's duration (a `Timer`, since neural audio has no `willSpeakRangeOfSpeechString` callbacks).
 - **Fallback:** if the server isn't reachable (still loading, not installed), `speak()` silently falls back to `speakSystem()` (Apple `AVSpeechSynthesizer`). The app always speaks *something*.
+
+**Streaming (perceived-latency fix, server-side done).** Batch synthesis is ~1× real-time, so a long reply means ~22s of silence before the first word. `/tts_stream` fixes the *felt* latency: per-sentence chunks (`split_stream`, capped at `TTS_STREAM_MAX_CHUNK`=90 chars — the measured M3 Pro sweet spot) shipped as they finish → ~2.4s to first word, ~0.75s total gap, then gapless. It stays gapless on replies of *any* length because synth runs >1× real-time (so it never falls behind playback). Investigated alternatives and rejected them: **bf16** (~6%, noise — decode is dispatch-bound, not bandwidth-bound), and an **MLX/Chatterbox-Turbo** port (token-level streaming gives ~1.1s first-audio but sub-real-time throughput → stutters on long replies, plus a second stack). To finish: `main.swift` POSTs `/tts_stream`, reads frames into an `AVAudioPlayer` queue, paces the HUD per chunk.
 
 Setup (one-time) and tuning:
 
