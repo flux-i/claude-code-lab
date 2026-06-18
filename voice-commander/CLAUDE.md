@@ -83,10 +83,26 @@ Run from `/Applications` (stable path → no app-translocation breaking TCC). Bu
 
 Resume the stored session when it fits the hard ceiling **and** is either recent or small enough that age stops mattering — otherwise start fresh. Concretely (`voice-agent.sh`):
 
-- **Resume** if `ctx < 300k` (`MAX_CTX`, hard ceiling) **and** (`age < 1h` (`MAX_AGE`) **or** `ctx ≤ 110k` (`OLD_OK_CTX`)).
+- **Resume** if `ctx < 800k` (`HARD_MAX_CTX`) **and** (`age < 1h` (`MAX_AGE`) **or** `ctx ≤ 110k` (`OLD_OK_CTX`)).
 - So a small conversation (≤110k) resumes even when it's hours old; only sessions that are *both* old *and* sizable are abandoned.
+- **Context heads-up (per user):** rather than silently resetting when a conversation gets large, when a *resumed* session is past `ALERT_CTX` (400k) we speak a one-time heads-up — *"this conversation has grown to about N thousand tokens… say new conversation to start fresh"* — and let the user decide. At `HARD_MAX_CTX` (800k) we must start fresh and say so. The `alerted` flag in `session.json` makes the warning fire once. (The model window is ~1M, so 400k is a "getting large" warning, not a wall.)
+- **"new conversation" voice command:** if the spoken command matches `new/fresh conversation`, `start over/fresh`, or `reset conversation`, the session state is wiped and it confirms — no agent call.
 
 **Context size (`ctx`)** is read from the transcript's **last assistant message** — `input + cache_read + cache_creation` tokens — *not* the cumulative `claude -p` usage. The cumulative number sums cache-reads and subagent tokens across every internal step, inflating a ~50k conversation to 400k+ and tripping the cap for the wrong reason (a busy command, not a big conversation). State: `~/.claude/voice/session.json`.
+
+## Streaming the agent (reasoning-while-it-works)
+
+By default `voice-agent.sh` blocks on `claude -p --output-format json` and prints only the final reply — so a long task is silent until it's done. With **`VOICE_STREAM=1`** it instead runs `--output-format stream-json --verbose` and emits a tab-delimited **line protocol** on stdout so the caller can speak progress as it happens:
+
+| line | meaning |
+|---|---|
+| `SAY\t<text>` | the model's own one-line narration before a step (nudged via the system prompt) |
+| `TOOL\t<phrase>` | spoken fallback for a tool it's about to run (`Bash`→"running a command", etc.) |
+| `ALERT\t<text>` | a heads-up (e.g. the context-size warning above) |
+| `RESULT\t<text>` | the final answer |
+| `SID\t<id>` | session id (internal) |
+
+A `jq` filter turns Claude's event stream into these lines: an assistant turn that also calls a tool has interstitial narration (→ `SAY`); a text-only assistant turn is the final answer (skipped — it arrives as `result`). **Default mode is unchanged**, so the current app keeps working; streaming is consumed by the app only after the planned `main.swift` integration (read the protocol → `AVAudioPlayer` queue + HUD via `/tts_stream`, plus key-press **barge-in**: stop speaking, listen, send, resume). Test it from the CLI by piping `VOICE_STREAM=1 voice-agent.sh "…"` into a speaker harness.
 
 ## Deployment
 
