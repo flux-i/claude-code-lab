@@ -50,9 +50,28 @@ HARD_MAX_CTX=800000   # 800k — never resume beyond this; force fresh and annou
 ALERT_CTX=400000      # 400k — warn (once) that the conversation is getting large
 OLD_OK_CTX=110000     # 100k (+10k): a session this small resumes even if >1h old
 
+# --- Orchestration -----------------------------------------------------------
+# Every command is first sent to a small ROUTER llm that decides, for THIS command:
+# which model + reasoning effort the worker should use, and whether to resume the
+# existing conversation or start fresh. It honors explicit directives in the command
+# ("use opus", "xhigh reasoning", "quick answer", …) and otherwise picks sensibly.
+# The router runs on sonnet/medium (it's just a fast classifier); ordinary tasks
+# default to sonnet/high, with opus/xhigh reserved for hard work or when asked. The
+# "new conversation" command and the HARD_MAX_CTX cap remain deterministic overrides
+# regardless of what the router says.
+ORCH_MODEL="${VOICE_ORCH_MODEL:-sonnet}"    # the router/orchestrator model (fast classifier)
+ORCH_EFFORT="${VOICE_ORCH_EFFORT:-medium}"  # the router/orchestrator reasoning effort
+DEF_MODEL="${VOICE_DEFAULT_MODEL:-sonnet}"  # worker fallback if routing fails/disabled
+DEF_EFFORT="${VOICE_DEFAULT_EFFORT:-high}"  # worker effort fallback
+ROUTE_ENABLED="${VOICE_ROUTER:-1}"          # set 0 to bypass the router (falls back to ctx/age heuristic + defaults)
+
 emit() {                                  # one protocol line (real tab delimiter)
-  print -r -- "$1"$'\t'"$2"
-  [[ "$STREAM" == "1" ]] && print -r -- "$(date '+%H:%M:%S')  $1  $2" >> "$LOG_DIR/protocol.log"
+  # The protocol is one line per message, so a newline in the text would split it
+  # across stdout lines — the continuation lines have no TAG and get dropped (this
+  # silently truncated multi-line replies, e.g. poems). Flatten newlines to spaces.
+  local text=${2//$'\n'/ }; text=${text//$'\r'/ }
+  print -r -- "$1"$'\t'"$text"
+  [[ "$STREAM" == "1" ]] && print -r -- "$(date '+%H:%M:%S')  $1  $text" >> "$LOG_DIR/protocol.log"
 }
 
 # ---- voice command: start a new conversation on demand ----------------------
@@ -85,10 +104,19 @@ ctx_of_session() {
 now=$(date +%s)
 resume=()
 reason="new"
+sid=""
+last=0
+age=0
 prev_ctx=0
 alerted=0
 forced_reset=0
+TASK="$PROMPT"              # worker prompt — the router may strip a model/effort directive from it
+WMODEL="$DEF_MODEL"         # worker model  (router decides; falls back to default)
+WEFFORT="$DEF_EFFORT"       # worker effort (router decides; falls back to default)
+route_mode=""              # "resume" | "new" from the router (guardrails can still override)
+route_reason=""
 
+# Load prior session facts. The resume/new decision itself is made below (router + guardrails).
 if [[ -f "$STATE" ]]; then
   sid=$(jq -r '.session_id // empty' "$STATE" 2>/dev/null)
   last=$(jq -r '.last_used // 0'     "$STATE" 2>/dev/null)
@@ -96,15 +124,95 @@ if [[ -f "$STATE" ]]; then
   alerted=$(jq -r '.alerted // 0'    "$STATE" 2>/dev/null)
   prev_ctx=${ctx:-0}
   age=$(( now - ${last:-0} ))
-  if [[ -n "$sid" ]] && (( prev_ctx < HARD_MAX_CTX )) && (( age < MAX_AGE || prev_ctx <= OLD_OK_CTX )); then
-    resume=(--resume "$sid")
-    reason="resume (age=${age}s ctx=${prev_ctx})"
-  elif [[ -n "$sid" ]] && (( prev_ctx >= HARD_MAX_CTX )); then
-    reason="new (ctx=${prev_ctx} ≥ HARD_MAX — forced reset)"
-    forced_reset=1
-  else
-    reason="new (age=${age}s stale)"
+  (( prev_ctx >= HARD_MAX_CTX )) && forced_reset=1
+fi
+
+# A "usable" session is one we could legitimately resume (exists and under the hard cap).
+session_exists=0
+[[ -n "$sid" ]] && (( prev_ctx < HARD_MAX_CTX )) && session_exists=1
+
+# ---- Router: pick the worker's model + effort + resume/new for THIS command -------
+# One fast ephemeral sonnet/medium call. Honors explicit directives in the command and
+# otherwise chooses sensibly; replies with a single minified JSON object. --no-session-
+# persistence keeps it from creating a resumable session of its own.
+if [[ "$ROUTE_ENABLED" == "1" ]]; then
+  ROUTER_SYS='You are the dispatcher for a push-to-talk voice assistant backed by Claude Code. Read the spoken COMMAND (and the SESSION line) and decide how to run it. Output ONLY one minified JSON object — no prose, no markdown, no code fences. Do NOT use tools and do NOT perform the task.
+
+MODELS (capability / speed / cost per 1M tokens in/out):
+- haiku  = Claude Haiku 4.5 — fastest, cheapest ($1/$5), 200K context. Best for trivial or quick commands, simple lookups, short confirmations. Does NOT support a reasoning effort.
+- sonnet = Claude Sonnet 4.6 — balanced speed + intelligence ($3/$15), 1M context. The everyday default: ordinary commands, explanations, light coding. Effort low–high.
+- opus   = Claude Opus 4.8 — most capable, slowest, priciest ($5/$25), 1M context. Use for hard coding, debugging, multi-step reasoning, architecture, or long autonomous work. Effort low–xhigh.
+
+EFFORT (reasoning depth vs latency — ignored for haiku, which has none):
+- low    = fastest, shallowest; simple well-scoped or latency-sensitive work
+- medium = balanced
+- high   = deeper reasoning; the right minimum for most real work
+- xhigh  = deepest and slowest; only the hardest coding/agentic tasks. OPUS ONLY — never pair xhigh with sonnet or haiku.
+
+Output keys:
+"model": "opus" | "sonnet" | "haiku"
+"effort": "low" | "medium" | "high" | "xhigh"
+"mode": "resume" | "new"
+"prompt": the task to run, with any instruction about WHICH model or effort to use removed
+"reason": at most 8 words
+
+Rules:
+- If the COMMAND explicitly names a model and/or a reasoning level (e.g. "use opus", "with sonnet", "xhigh"/"max reasoning"/"think hard", "quick"/"low effort"), honor it EXACTLY and strip that phrase from "prompt".
+- Otherwise choose by difficulty: trivial/quick -> haiku; ordinary requests -> sonnet/high; hard coding, debugging, multi-step reasoning, or architecture -> opus/high (opus/xhigh only if genuinely hard).
+- Keep effort valid for the model: never xhigh unless model is opus.
+- mode: prefer "resume" when the COMMAND continues the current topic or a recent session exists; choose "new" for a clearly different topic or when no usable session exists.'
+
+  router_input="COMMAND: $PROMPT
+SESSION: exists=$session_exists age_seconds=$age context_tokens=$prev_ctx"
+
+  # Pure classifier: --system-prompt REPLACES Claude Code's large default prompt
+  # (not --append-, which keeps it), and an empty --allowed-tools means no tools are
+  # loaded. Keeps the router small/fast and stops it from ever trying to DO the task.
+  router_raw=$("$CLAUDE" -p "$router_input" \
+        --model "$ORCH_MODEL" --effort "$ORCH_EFFORT" \
+        --system-prompt "$ROUTER_SYS" \
+        --allowed-tools '' \
+        --no-session-persistence \
+        --dangerously-skip-permissions 2>>"$LOG_DIR/agent.err")
+  router_json=${router_raw//'```json'/}; router_json=${router_json//'```'/}   # strip any code fences
+  if print -r -- "$router_json" | jq -e . >/dev/null 2>&1; then
+    m=$(print -r --  "$router_json" | jq -r '.model  // empty')
+    e=$(print -r --  "$router_json" | jq -r '.effort // empty')
+    md=$(print -r -- "$router_json" | jq -r '.mode   // empty')
+    pr=$(print -r -- "$router_json" | jq -r '.prompt // empty')
+    rr=$(print -r -- "$router_json" | jq -r '.reason // empty')
+    [[ "$m"  == (opus|sonnet|haiku) ]]     && WMODEL="$m"
+    [[ "$e"  == (low|medium|high|xhigh) ]] && WEFFORT="$e"
+    [[ "$md" == (resume|new) ]]            && route_mode="$md"
+    [[ -n "$pr" ]]                          && TASK="$pr"
+    route_reason="$rr"
   fi
+fi
+
+# Keep the worker's model+effort combo valid (the CLI 400s otherwise): haiku takes no
+# effort, and xhigh is opus-only. The router is told this too; this is the safety net.
+[[ "$WMODEL" == haiku* ]] && WEFFORT=""
+[[ "$WEFFORT" == "xhigh" && "$WMODEL" != opus* ]] && WEFFORT="high"
+WORKER_FLAGS=(--model "$WMODEL")
+[[ -n "$WEFFORT" ]] && WORKER_FLAGS+=(--effort "$WEFFORT")
+
+# ---- Resume/new decision: the router is advisory; these guardrails win -------------
+if (( forced_reset == 1 )) || [[ -z "$sid" ]]; then
+  route_mode="new"                       # hard cap hit, or no prior session → must be fresh
+elif [[ -z "$route_mode" ]]; then        # router disabled/unparseable → fall back to ctx/age heuristic
+  if (( session_exists == 1 )) && (( age < MAX_AGE || prev_ctx <= OLD_OK_CTX )); then
+    route_mode="resume"
+  else
+    route_mode="new"
+  fi
+fi
+
+if [[ "$route_mode" == "resume" && "$session_exists" == "1" ]]; then
+  resume=(--resume "$sid")
+  reason="resume (router; age=${age}s ctx=${prev_ctx}; $WMODEL/$WEFFORT)"
+else
+  resume=()
+  reason="new (${route_reason:-heuristic}; $WMODEL/$WEFFORT)"
 fi
 
 # Context heads-up: resuming a session that has grown past ALERT_CTX (warn once), or
@@ -135,7 +243,10 @@ JQ_PROTO='
       ($c[] | select(.type=="tool_use") | "TOOL\t" + (.name // ""))
     else empty end
   elif .type=="result" then
-    ("SID\t" + (.session_id // "")), ("RESULT\t" + (.result // ""))
+    # Collapse newlines so a multi-line answer (e.g. a poem) stays a single protocol
+    # line — the read loop below is line-based and would otherwise lose every line
+    # after the first. Mirrors the SAY branch above.
+    ("SID\t" + (.session_id // "")), ("RESULT\t" + ((.result // "") | gsub("\n";" ")))
   else empty end
 '
 
@@ -150,7 +261,7 @@ run_stream() {  # consume events; fill result/sid_seen; emit SAY/TOOL live (stre
       TOOL)   : ;;                    # tool-phrase fallback removed — too repetitive ("running a command…")
       RESULT) result="$rest" ;;
     esac
-  done < <( "$CLAUDE" -p "$PROMPT" "$@" \
+  done < <( "$CLAUDE" -p "$TASK" "$@" "${WORKER_FLAGS[@]}" \
               --output-format stream-json --verbose \
               --append-system-prompt "$SYS" \
               --dangerously-skip-permissions 2>>"$LOG_DIR/agent.err" \
@@ -159,7 +270,7 @@ run_stream() {  # consume events; fill result/sid_seen; emit SAY/TOOL live (stre
 
 run_json() {  # default: block, capture full json, extract result (live-app contract)
   local out
-  out=$("$CLAUDE" -p "$PROMPT" "$@" \
+  out=$("$CLAUDE" -p "$TASK" "$@" "${WORKER_FLAGS[@]}" \
           --output-format json \
           --append-system-prompt "$SYS" \
           --dangerously-skip-permissions 2>>"$LOG_DIR/agent.err")
@@ -191,6 +302,8 @@ fi
 {
   print -r -- "==== $(date '+%Y-%m-%d %H:%M:%S')  [$reason]  stream=$STREAM ===="
   print -r -- "PROMPT : $PROMPT"
+  print -r -- "ROUTER : model=$WMODEL effort=${WEFFORT:-none} mode=$route_mode  (${route_reason:-—})"
+  [[ "$TASK" != "$PROMPT" ]] && print -r -- "TASK   : $TASK"
   print -r -- "CTX    : ${ctx:-0}   SID: $sid"
   [[ -n "$context_alert" ]] && print -r -- "ALERT  : $context_alert"
   print -r -- "RESULT : $result"

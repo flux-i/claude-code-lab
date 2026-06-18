@@ -231,6 +231,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var audioPlayer: AVAudioPlayer?
     private var karaokeTimer: Timer?
 
+    // Speech-to-text
+    //  Primary: Whisper (whisper.cpp large-v3-turbo) from a local server (see stt-server/) —
+    //  accent-robust, English, offline. Fallback: Apple's on-device SFSpeechRecognizer,
+    //  which also drives the live partial-word HUD while you speak.
+    private let sttPort = 8766
+    private let sttRunScript = ("~/.claude/voice/stt-server/run.sh" as NSString).expandingTildeInPath
+    private var sttInferenceURL: URL { URL(string: "http://127.0.0.1:\(sttPort)/inference")! }
+    private var sttRootURL: URL { URL(string: "http://127.0.0.1:\(sttPort)/")! } // liveness (no /health)
+    private var sttUp = false                  // cached liveness, refreshed by pollSTTHealth()
+
     // UI
     private var statusItem: NSStatusItem!
     private var stateMenuItem: NSMenuItem!
@@ -251,7 +261,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     // Recording state
     private var isRecording = false
     private var didRun = false
-    private var transcript = ""
+    private var transcript = ""             // final text → runClaude; SFSpeech sets it live,
+                                            // Whisper overwrites it on release when available
+    private var usingWhisper = false        // this turn routes through the Whisper server
+    private var recordWriter: AVAudioFile?  // 16 kHz mono WAV captured for Whisper
+    private var recordURL: URL?
+    private var recordConverter: AVAudioConverter?  // input HW format → 16 kHz mono (held across taps)
 
     // Streaming response state
     private var agentProc: Process?           // in-flight voice-agent.sh (killed on barge-in)
@@ -261,6 +276,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var gotResult = false             // a RESULT line arrived this turn
     private var runID = 0                     // bumped each turn; stale callbacks are dropped
     private var lastEnqueued = ""             // de-dupe: skip a segment identical to the previous
+
+    // Deferred ack: break the silence only when Claude takes a while. A short cue is
+    // spoken if nothing real has been said within `ackDelay`; cancelled the instant
+    // narration/answer arrives, so fast replies stay silent (no per-reply spam).
+    private var ackTimer: Timer?
+    private var ackIndex = 0
+    private let ackDelay: TimeInterval = 2.5
+    private let ackCues = [
+        "One sec…", "Working on it…", "On it…", "Just a moment…",
+        "Give me a sec…", "Hang tight…", "Let me check…", "Looking into it…",
+        "Right away…", "Let me see…", "Checking…", "Pulling that up…",
+        "One moment…", "Almost there…", "Let me dig in…", "Working through it…",
+        "Getting that for you…", "Let me take a look…", "Hold on a sec…", "Just a second…",
+        "Sorting that out…", "Let me figure this out…", "Diving in…", "Let me handle that…",
+        "Getting to it…", "Bear with me…", "Let me pull that together…", "Thinking it through…",
+        "Looking that up…", "On the case…", "Give me a moment…", "Let me sort this…",
+        "Working on that now…", "Checking on that…", "Let me get that…", "Pulling it together…",
+        "Let me run that down…", "Hang on a moment…", "Getting that sorted…", "On it, one moment…",
+        "Let me track that down…", "Working it out…", "Just a tick…", "Let me have a look…",
+        "Coming right up…", "Give me just a second…", "Let me piece this together…", "Still on it…",
+        "Let me dig into that…", "Just a moment more…", "Crunching on that…", "Let me look that over…",
+        "Almost got it…", "Working away…",
+    ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -272,6 +310,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         installHotkeyMonitors()
         refreshAccessibilityState()
         ensureTTSServer()
+        ensureSTTServer()
+        pollSTTHealth()
 
         if CommandLine.arguments.contains("--demo") { runDemo() }
     }
@@ -388,6 +428,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         }
         transcript = ""
         didRun = false
+        // Route this whole turn through Whisper if the server is up; otherwise Apple-only.
+        // (Read off the cached flag so there's no per-keypress health-check latency.)
+        usingWhisper = sttUp
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
@@ -399,9 +442,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         guard format.sampleRate > 0 else {
             flash(.error, error: "No audio input. Check microphone permission."); return
         }
+
+        // In Whisper mode, also capture the mic to a 16 kHz mono WAV to POST on release.
+        // SFSpeech still runs underneath for the live HUD + as a fallback.
+        recordWriter = nil; recordConverter = nil; recordURL = nil
+        if usingWhisper {
+            if !beginWavCapture(from: format) { usingWhisper = false }  // capture setup failed → Apple-only
+        }
+
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.request?.append(buffer)
+            guard let self = self else { return }
+            self.request?.append(buffer)
+            if self.usingWhisper { self.appendWav(buffer) }
         }
         audioEngine.prepare()
         do { try audioEngine.start() }
@@ -414,9 +467,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
                 DispatchQueue.main.async {
                     self.state.transcript = self.transcript
                 }
-                if result.isFinal { self.finishAndRun() }
+                // In Whisper mode the Whisper response decides when to run, not SFSpeech.
+                if result.isFinal && !self.usingWhisper { self.finishAndRun() }
             }
-            if error != nil { self.finishAndRun() }
+            if error != nil && !self.usingWhisper { self.finishAndRun() }
         }
 
         isRecording = true
@@ -436,11 +490,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         request?.endAudio()
+        recordWriter = nil   // close + flush the WAV header
         DispatchQueue.main.async {
             self.setBarSymbol("hourglass", tint: .systemOrange)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.finishAndRun()
+        if usingWhisper, let url = recordURL {
+            // Release fires the POST immediately — no silence timeout needed.
+            transcribeWithWhisper(url)
+        } else {
+            // Apple path: SFSpeech finalizes on its own; 2 s is the safety net.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.finishAndRun()
+            }
         }
     }
 
@@ -463,6 +524,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         }
     }
 
+    // MARK: Whisper capture + transcription
+    /// Open a 16 kHz mono Int16 WAV and a converter from the mic's hardware format.
+    /// Returns false if setup fails (caller then falls back to Apple-only for this turn).
+    private func beginWavCapture(from inputFormat: AVAudioFormat) -> Bool {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claudevoice-\(runID).wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+        ]
+        guard let file = try? AVAudioFile(forWriting: url, settings: settings,
+                                          commonFormat: .pcmFormatInt16, interleaved: true),
+              let converter = AVAudioConverter(from: inputFormat, to: file.processingFormat)
+        else { return false }
+        recordWriter = file
+        recordConverter = converter
+        recordURL = url
+        return true
+    }
+
+    /// Convert one mic buffer to 16 kHz mono and append it to the WAV (called on the audio thread).
+    private func appendWav(_ buffer: AVAudioPCMBuffer) {
+        guard let conv = recordConverter, let file = recordWriter else { return }
+        let ratio = file.processingFormat.sampleRate / buffer.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: cap) else { return }
+        var fed = false
+        var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        if err == nil && out.frameLength > 0 { try? file.write(from: out) }
+    }
+
+    /// POST the recorded WAV to the Whisper server; use its text, else the Apple transcript.
+    private func transcribeWithWhisper(_ wavURL: URL) {
+        let myID = runID
+        let appleFallback = transcript      // whatever SFSpeech captured live this turn
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let whisper = self.postWhisper(wavURL)
+            try? FileManager.default.removeItem(at: wavURL)
+            DispatchQueue.main.async {
+                guard myID == self.runID else { return }   // superseded by a barge-in
+                let final = (whisper?.isEmpty == false) ? whisper! : appleFallback
+                self.transcript = final
+                self.finishAndRun()
+            }
+        }
+    }
+
+    /// Synchronous multipart POST to whisper-server /inference; nil on any failure.
+    private func postWhisper(_ wavURL: URL) -> String? {
+        guard let wav = try? Data(contentsOf: wavURL) else { return nil }
+        let boundary = "claudevoice-boundary-\(runID)"
+        var body = Data()
+        func append(_ s: String) { body.append(s.data(using: .utf8)!) }
+        for (name, value) in [("response_format", "json"), ("temperature", "0"), ("language", "en")] {
+            append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
+        }
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+        append("Content-Type: audio/wav\r\n\r\n")
+        body.append(wav)
+        append("\r\n--\(boundary)--\r\n")
+
+        var req = URLRequest(url: sttInferenceURL)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        req.timeoutInterval = 30
+
+        let sem = DispatchSemaphore(value: 0)
+        var result: String?
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            guard let data = data, let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return }
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let text = obj["text"] as? String {
+                // whisper-server emits a newline per segment — collapse to a clean one-liner.
+                result = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" })
+                    .joined(separator: " ")
+            }
+        }.resume()
+        _ = sem.wait(timeout: .now() + 31)
+        return result
+    }
+
     // MARK: Execution (session-aware shell agent, STREAMING)
     //
     // Runs voice-agent.sh with VOICE_STREAM=1 and reads its tab-delimited line
@@ -476,8 +629,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         speechQueue.removeAll()
         isSpeaking = false
         lastEnqueued = ""
-        // No canned ack — the violet "thinking" orb is the cue; we speak only the
-        // model's own narration (if any) and then the answer.
+        // Deferred ack: if Claude produces nothing to say within `ackDelay`, speak one
+        // short cue so the wait doesn't feel broken. It's cancelled the moment real
+        // narration or the answer arrives (see dispatchProtocolLine), so quick replies
+        // never hear it — the violet "thinking" orb covers the gap until then.
+        ackTimer?.invalidate()
+        let cue = ackCues[ackIndex % ackCues.count]; ackIndex += 1
+        ackTimer = Timer.scheduledTimer(withTimeInterval: ackDelay, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.ackTimer = nil
+            guard myID == self.runID, self.agentRunning, !self.gotResult,
+                  self.speechQueue.isEmpty, !self.isSpeaking else { return }
+            self.enqueueSpeech(cue)
+        }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -540,8 +704,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
             guard myID == self.runID else { return }
             switch tag {
             case "ALERT", "SAY", "TOOL":
+                self.ackTimer?.invalidate(); self.ackTimer = nil   // real output — skip the deferred cue
                 self.enqueueSpeech(text)
             case "RESULT":
+                self.ackTimer?.invalidate(); self.ackTimer = nil
                 self.gotResult = true
                 for s in self.splitSentences(text) { self.enqueueSpeech(s) }
             default:
@@ -562,6 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     }
 
     private func finishResponse() {
+        ackTimer?.invalidate(); ackTimer = nil
         setMenuState("Idle")
         setBarSymbol("mic", tint: nil)
         hud.hide(after: 1.2)
@@ -571,6 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     /// invalidate pending callbacks (via runID) so nothing from the old turn leaks in.
     private func cancelCurrentOperation() {
         runID &+= 1
+        ackTimer?.invalidate(); ackTimer = nil
         agentProc?.terminate()
         agentProc = nil
         agentRunning = false
@@ -748,6 +916,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         }.resume()
         _ = sem.wait(timeout: .now() + 1.0)
         return up
+    }
+
+    // MARK: Whisper STT server lifecycle
+    /// Launch the local whisper.cpp server at startup if it isn't already listening.
+    private func ensureSTTServer() {
+        guard FileManager.default.fileExists(atPath: sttRunScript) else { return }  // not installed yet
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self, !self.isSTTUp() else { return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = [self.sttRunScript]
+            let logPath = (self.logDir as NSString).appendingPathComponent("stt-server.log")
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+            if let fh = FileHandle(forWritingAtPath: logPath) {
+                p.standardOutput = fh
+                p.standardError = fh
+            }
+            try? p.run()   // detached; first launch loads the model (~10-20s)
+        }
+    }
+
+    /// whisper-server has no /health — once the port answers, the model is already loaded.
+    private func isSTTUp() -> Bool {
+        var req = URLRequest(url: sttRootURL)
+        req.timeoutInterval = 0.6
+        let sem = DispatchSemaphore(value: 0)
+        var up = false
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            if let h = resp as? HTTPURLResponse, h.statusCode < 500 { up = true }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 1.0)
+        return up
+    }
+
+    /// Poll liveness every few seconds so startRecording reads a cached flag (no per-keypress latency).
+    private func pollSTTHealth() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let up = self.isSTTUp()
+            DispatchQueue.main.async {
+                self.sttUp = up
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.pollSTTHealth() }
+            }
+        }
     }
 
     /// Karaoke sync: as each range is spoken, show only the last ~10 spoken words.

@@ -1,1 +1,7 @@
 build/
+
+# stt-test: keep the harness source (apple-stt.swift, run_bakeoff.py); exclude the
+# compiled binary, the cached results, and the private audio clips it transcribes.
+stt-test/apple-stt
+stt-test/apple_results.json
+stt-test/wav/

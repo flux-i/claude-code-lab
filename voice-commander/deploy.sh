@@ -14,7 +14,7 @@ set -euo pipefail
 
 HERE="${0:A:h}"                       # voice-commander/ in the repo
 VOICE="$HOME/.claude/voice"
-mkdir -p "$VOICE/tts-server" "$VOICE/logs"
+mkdir -p "$VOICE/tts-server" "$VOICE/stt-server" "$VOICE/logs"
 
 # Source-of-truth files → symlinks (edit the repo, it's instantly live).
 ln -sf "$HERE/voice-agent.sh"        "$VOICE/voice-agent.sh"
@@ -25,8 +25,15 @@ cp "$HERE/tts-server/run.sh" "$VOICE/tts-server/run.sh"
 chmod +x "$VOICE/tts-server/run.sh"
 [[ -f "$HERE/tts-server/reference.wav" ]] && cp "$HERE/tts-server/reference.wav" "$VOICE/tts-server/reference.wav"
 
+# STT server (whisper.cpp): only run.sh lives in the repo — the binary + model are
+# built locally by stt-server/setup.sh under $VOICE/stt-server. run.sh is copied for
+# the same ${0:A:h} reason as the TTS one (no editable source to symlink).
+cp "$HERE/stt-server/run.sh" "$VOICE/stt-server/run.sh"
+chmod +x "$VOICE/stt-server/run.sh"
+
 echo "deployed → $VOICE"
 echo "  voice-agent.sh        → $(readlink "$VOICE/voice-agent.sh")"
 echo "  tts-server/server.py  → $(readlink "$VOICE/tts-server/server.py")"
 echo "  tts-server/run.sh     (copy)"
+echo "  stt-server/run.sh     (copy)"
 echo "Restart the TTS server to pick up a server.py change:  pkill -f server.py; $VOICE/tts-server/run.sh &"

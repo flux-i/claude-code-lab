@@ -6,12 +6,40 @@ Push-to-talk macOS menu-bar app that runs spoken commands through headless Claud
 
 ```
 ClaudeVoice.app  ─→  ~/.claude/voice/voice-agent.sh      →  claude -p          (shell: session logic)
- (Swift/SwiftUI)  └→  ~/.claude/voice/tts-server/run.sh   →  Chatterbox neural  (python: speech)
+ (Swift/SwiftUI)  ├→  ~/.claude/voice/tts-server/run.sh   →  Chatterbox neural  (python: TTS)
+                  └→  ~/.claude/voice/stt-server/run.sh   →  whisper.cpp        (c++:    STT)
 ```
 
-- **`Sources/main.swift`** — the entire app, single file. Hotkey + Apple `Speech` (on-device STT) + SwiftUI HUD + TTS.
+- **`Sources/main.swift`** — the entire app, single file. Hotkey + speech-to-text (Whisper primary, Apple `Speech` fallback) + SwiftUI HUD + TTS.
 - **`voice-agent.sh`** — ALL Claude/session logic lives here, on purpose (the app just shells out to it with the transcript and reads stdout). Source of truth is `voice-commander/voice-agent.sh` in the repo; `deploy.sh` symlinks it to `~/.claude/voice/voice-agent.sh`, so editing the repo file is instantly live.
 - **`tts-server/`** — neural text-to-speech via Resemble AI's **Chatterbox** (local HTTP server, Python venv). The app POSTs the reply text and plays the returned WAV. See "Text-to-speech" below.
+- **`stt-server/`** — speech-to-text via **whisper.cpp** (`large-v3-turbo`, local HTTP server, no Python — the prebuilt `whisper-server` binary *is* the server). The app POSTs the recorded WAV and uses the returned transcript. See "Speech-to-text" below.
+
+### Speech-to-text (Whisper primary, Apple fallback — hybrid)
+
+Push-to-talk audio is transcribed by **Whisper** (`whisper.cpp`, `large-v3-turbo`) running
+as a local server, with Apple's on-device `SFSpeechRecognizer` kept underneath. Whisper was
+chosen for **accent robustness** (English): on the user's own corpus, Apple on-device mangled
+domain proper nouns (`LangFuse`→"length fuse", `Codex`→"Kotex") and silently dropped some
+longer clips. How the two engines combine (`main.swift`):
+
+- The hotkey-down path **always** starts `SFSpeechRecognizer` (live partial words → the HUD)
+  **and**, when the Whisper server is up, simultaneously records the mic to a 16 kHz mono WAV
+  (`beginWavCapture`/`appendWav`, via `AVAudioConverter`).
+- On key-up: if Whisper is up, the WAV is POSTed to `whisper-server` `/inference`
+  (`transcribeWithWhisper`/`postWhisper`, multipart, `response_format=json`, `language=en`) and
+  its transcript is used; **if the POST fails or returns empty, the live Apple transcript is the
+  fallback**. If the server is down at key-down, the turn is Apple-only (today's behavior, incl.
+  the 2 s silence timeout). The per-turn route is `usingWhisper`, decided from a cached `sttUp`.
+- **Liveness:** `whisper-server` has no `/health`; once the port answers, the model is already
+  loaded. `pollSTTHealth()` refreshes the cached `sttUp` every 3 s so key-down has zero
+  health-check latency. The app auto-launches the server at startup (`ensureSTTServer()`), same
+  as the TTS one; first launch loads the model (~10-20s) and until then commands use Apple.
+- **Barge-in:** the Whisper POST completion is guarded on `runID` (like the TTS path), so a
+  superseded turn's transcript is dropped.
+
+See `stt-server/README.md` for setup and tuning (model/quantization, threads). Logs:
+`~/.claude/voice/logs/stt-server.log`.
 
 ### Text-to-speech (neural, with fallback)
 
@@ -71,6 +99,7 @@ Run from `/Applications` (stable path → no app-translocation breaking TCC). Bu
 3. **Hotkey is a bare modifier** (Right ⌘, keyCode 54) → detected via `NSEvent` global `.flagsChanged` monitor, which *requires* Accessibility. A bare modifier cannot be a Carbon hotkey; don't "simplify" it to `RegisterEventHotKey`.
 4. **Don't block the main thread** on `claude` (it takes seconds). Execution runs on a background queue; UI/state updates dispatch back to main.
 5. **TTS server is a separate process** under `~/.claude/voice/tts-server` (its own Python 3.11 venv, ~torch). It is NOT bundled in the app and survives rebuilds — `~/.claude/voice/tts-server/server.py` is a symlink to `voice-commander/tts-server/server.py`, so editing the repo file is live; just restart the server to reload (`pkill -f server.py; ~/.claude/voice/tts-server/run.sh &`). No app rebuild needed. If speech sounds like the old robotic voice, the server is down/loading → check `~/.claude/voice/logs/tts-server.log` and `curl 127.0.0.1:8765/health`. The model load on first launch takes ~10-20s; until then replies use the Apple fallback voice.
+6. **STT server is a separate process** under `~/.claude/voice/stt-server` (a built `whisper.cpp`, no Python). Like the TTS server it is NOT bundled and survives rebuilds; restart with `pkill -f whisper-server; ~/.claude/voice/stt-server/run.sh &`. If transcripts look like the old Apple mistakes (mangled proper nouns), the Whisper server is down/loading → check `~/.claude/voice/logs/stt-server.log` and `curl 127.0.0.1:8766/` (any HTTP response = up); until it answers, the app transcribes with the Apple fallback. The model is **not** committed — re-run `stt-server/setup.sh` on a fresh machine.
 
 ## HUD / UX invariants (per user)
 
@@ -79,14 +108,21 @@ Run from `/Applications` (stable path → no app-translocation breaking TCC). Bu
 - Reply is **streamed in a rolling ~10-word window synced to TTS**, never dumped in full. Card fades when speech ends. (Neural path: a `Timer` paces the window off the clip duration; system-fallback path: `willSpeakRangeOfSpeechString`.)
 - Orb colors: blue=listening, violet=thinking, green=speaking, rose=error.
 
+## Model & reasoning routing (the dispatcher)
+
+Every command is first sent to a fast **router** LLM (`claude -p --model sonnet --effort medium`, env: `VOICE_ORCH_MODEL`/`VOICE_ORCH_EFFORT`) that returns one minified JSON object — `{model, effort, mode, prompt, reason}` — deciding how to run the *worker*. It's a pure classifier: `--system-prompt` (not `--append-`) **replaces** Claude Code's large default prompt with just the catalog, `--allowed-tools ''` loads **no tools**, and `--no-session-persistence` keeps it from creating a session — so it's cheap and can't try to *do* the task. It knows the model catalog (haiku/sonnet/opus — capability, speed, cost) and the effort levels, honors explicit directives in the command ("use opus", "xhigh", "quick"), and otherwise picks by difficulty (trivial→haiku, ordinary→sonnet/high, hard→opus/high·xhigh). The worker is then `claude -p --model <m> [--effort <e>] [--resume …]` with the directive stripped from the prompt. Set `VOICE_ROUTER=0` to bypass the router (falls back to `VOICE_DEFAULT_MODEL`/`_EFFORT` = sonnet/high + the ctx/age heuristic below).
+
+- **Validity clamps (the CLI 400s otherwise):** `haiku` takes **no** `--effort`; `xhigh` is **opus-only** (clamped to `high` for sonnet/haiku). The router is told both rules; `voice-agent.sh` enforces them as a safety net.
+- **Cost:** the router adds one fast `claude` round-trip before the worker on every command (the app's "On it." ack covers the gap).
+
 ## Conversation rule
 
-Resume the stored session when it fits the hard ceiling **and** is either recent or small enough that age stops mattering — otherwise start fresh. Concretely (`voice-agent.sh`):
+The **router decides resume vs. new** from intent, but two deterministic guardrails always win (`voice-agent.sh`):
 
-- **Resume** if `ctx < 800k` (`HARD_MAX_CTX`) **and** (`age < 1h` (`MAX_AGE`) **or** `ctx ≤ 110k` (`OLD_OK_CTX`)).
-- So a small conversation (≤110k) resumes even when it's hours old; only sessions that are *both* old *and* sizable are abandoned.
-- **Context heads-up (per user):** rather than silently resetting when a conversation gets large, when a *resumed* session is past `ALERT_CTX` (400k) we speak a one-time heads-up — *"this conversation has grown to about N thousand tokens… say new conversation to start fresh"* — and let the user decide. At `HARD_MAX_CTX` (800k) we must start fresh and say so. The `alerted` flag in `session.json` makes the warning fire once. (The model window is ~1M, so 400k is a "getting large" warning, not a wall.)
-- **"new conversation" voice command:** if the spoken command matches `new/fresh conversation`, `start over/fresh`, or `reset conversation`, the session state is wiped and it confirms — no agent call.
+- **Hard cap:** at `ctx ≥ 800k` (`HARD_MAX_CTX`) we force a fresh session regardless of the router; no prior session likewise ⇒ new.
+- **"new conversation" voice command:** if the spoken command matches `new/fresh conversation`, `start over/fresh`, or `reset conversation`, the session state is wiped and it confirms — *before* the router even runs (no agent call).
+- **Router disabled/unparseable → ctx/age heuristic fallback:** resume if `ctx < 800k` **and** (`age < 1h` (`MAX_AGE`) **or** `ctx ≤ 110k` (`OLD_OK_CTX`)) — so a small conversation (≤110k) resumes even when hours old; only sessions that are *both* old *and* sizable are abandoned.
+- **Context heads-up (per user):** when a *resumed* session is past `ALERT_CTX` (400k) we speak a one-time heads-up — *"this conversation has grown to about N thousand tokens… say new conversation to start fresh"* — and let the user decide. At `HARD_MAX_CTX` (800k) we must start fresh and say so. The `alerted` flag in `session.json` makes the warning fire once. (The model window is ~1M, so 400k is a "getting large" warning, not a wall.)
 
 **Context size (`ctx`)** is read from the transcript's **last assistant message** — `input + cache_read + cache_creation` tokens — *not* the cumulative `claude -p` usage. The cumulative number sums cache-reads and subagent tokens across every internal step, inflating a ~50k conversation to 400k+ and tripping the cap for the wrong reason (a busy command, not a big conversation). State: `~/.claude/voice/session.json`.
 
@@ -110,4 +146,4 @@ A `jq` filter turns Claude's event stream into these lines: an assistant turn th
 
 ## Deployment
 
-`deploy.sh` installs the repo into `~/.claude/voice/` — symlinks `voice-agent.sh` + `tts-server/server.py`, copies `run.sh`. Run `tts-server/setup.sh` once to build the venv (it calls `deploy.sh`). The old Spokenly-dictation runner (`run-voice-command.sh`, `spokenly-hook.zsh`) has been removed — the app does its own on-device STT.
+`deploy.sh` installs the repo into `~/.claude/voice/` — symlinks `voice-agent.sh` + `tts-server/server.py`, copies both `run.sh` launchers (TTS + STT). Run `tts-server/setup.sh` once to build the venv and `stt-server/setup.sh` once to build whisper.cpp + download the model (both call `deploy.sh`). The STT runtime (`whisper.cpp/` build + `*.bin` model) lives only under `~/.claude/voice/stt-server/` and is never committed — same convention as the Python venv. The old Spokenly-dictation runner (`run-voice-command.sh`, `spokenly-hook.zsh`) has been removed; the app now transcribes locally via Whisper, with Apple on-device STT as the fallback (see "Speech-to-text").
