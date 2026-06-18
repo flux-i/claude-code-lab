@@ -81,23 +81,74 @@ func composeValue(_ win: AXUIElement) -> String {
     return (f.first.map { axStr($0, kAXValueAttribute as String) } ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-// Bring the user's previously-active app back to the front. Teams activates itself
-// ASYNCHRONOUSLY (and repeatedly) after a deep-link open, and on modern macOS a bare
-// activate() from a background CLI loses that race — so the user gets stranded in
-// Teams. Fix: after a gentle first try, HIDE Teams, which forces the OS to yield the
-// front to the previously-active app; then assert activation on it. Retry until it
-// sticks. If the user was already in Teams, leave it alone.
+// Bring the user's previously-active app back to the front. On macOS 26 a background
+// CLI tool CANNOT foreground another app via NSRunningApplication.activate() OR .hide()
+// — both are silently ignored (the OS only lets the frontmost / user-driven process
+// reorder apps, and Teams' Electron shell self-activates after a deep-link open). Even
+// AXUIElementSetAttributeValue(kAXFrontmost) returns success but does nothing. What DOES
+// work, with NO extra TCC permission (no Accessibility, no Automation), is asking
+// LaunchServices to (re)open the already-running app: `/usr/bin/open` foregrounds it as
+// a user-semantic open, which isn't subject to the cooperative-activation block. We
+// retry a few times in case Teams is still mid-way through its own async self-activation.
+// If the user was already in Teams, leave it alone.
+let FOCUS_DEBUG = ProcessInfo.processInfo.environment["TEAMS_FOCUS_DEBUG"] == "1"
+func fdbg(_ s: String) { if FOCUS_DEBUG { FileHandle.standardError.write(("[focus] " + s + "\n").data(using: .utf8)!) } }
+
+// Return focus to the user's previously-active app. THE HARD PART (macOS 26): Teams'
+// Electron shell self-activates ASYNCHRONOUSLY after a deep-link nav — empirically it
+// jumps to the front ~right as this CLI would normally exit (measured: the user's app is
+// still frontmost throughout our run, then Teams grabs the front <0.3s after we exit).
+// Fixing focus inline is therefore futile. On top of that, a background CLI cannot
+// reorder apps via NSRunningApplication.activate()/.hide() (both silently ignored on 26)
+// nor via AXUIElementSetAttributeValue(kAXFrontmost) (returns success, does nothing) —
+// the ONLY thing that works, with no extra TCC permission, is LaunchServices opening the
+// already-running app (`/usr/bin/open`). So: spawn a DETACHED helper (`__refocus`) that
+// OUTLIVES us, waits for Teams' late self-activation, and `open`s the previous app back.
+// The read/send result is already on stdout, so the caller answers immediately while
+// focus is corrected in the background (no added latency).
 func restoreFocus(_ app: NSRunningApplication?) {
     guard let app = app else { return }
-    let teams = teamsApp()
-    if let t = teams, t.processIdentifier == app.processIdentifier { return }
-    usleep(450_000)                         // let Teams finish its own async self-activation
-    for attempt in 0..<14 {
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return }
-        if attempt >= 1 { teams?.hide() }   // hiding Teams reliably yields the front
-        app.activate()
-        usleep(160_000)
+    if let t = teamsApp(), t.processIdentifier == app.processIdentifier { return }  // user was in Teams
+    var openArgs: [String] = []
+    if let url = app.bundleURL { openArgs = [url.path] }            // most robust
+    else if let bid = app.bundleIdentifier { openArgs = ["-b", bid] }
+    else { return }
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    child.arguments = ["__refocus", String(app.processIdentifier)] + openArgs
+    child.standardOutput = FileHandle.nullDevice
+    child.standardError = FOCUS_DEBUG ? FileHandle.standardError : FileHandle.nullDevice
+    try? child.run()
+    // intentionally NOT waitUntilExit() — detach so it fixes focus after we're gone
+}
+
+// Detached helper (run as `teams __refocus <prevPid> <open-args…>`): watch for Teams'
+// late self-activation and bring the previous app back via `/usr/bin/open`. Claws focus
+// back ONLY from Teams (never from a third app the user may have deliberately switched
+// to), stops once that app is stably front, and gives up after a few seconds.
+func refocusDaemon(prevPid: Int32, openArgs: [String]) {
+    setsid()                                        // detach from the parent's session/group
+    guard prevPid > 0, !openArgs.isEmpty else { return }
+    let deadline = Date().addingTimeInterval(8)
+    var sawTeams = false, stable = 0
+    while Date() < deadline {
+        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let teamsPid = teamsApp()?.processIdentifier
+        if let fp = frontPid, fp == teamsPid {                      // Teams grabbed → claw back
+            sawTeams = true; stable = 0
+            let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open"); t.arguments = openArgs
+            try? t.run(); t.waitUntilExit()
+            fdbg("daemon: clawed back from Teams")
+        } else if frontPid == prevPid {                            // sitting on the previous app
+            stable += 1
+            if sawTeams && stable >= 4 { fdbg("daemon: prev stable, done"); return }     // ~0.8s after claw-back
+            if !sawTeams && stable >= 12 { fdbg("daemon: teams never fronted, done"); return } // ~2.4s, no steal
+        } else {
+            fdbg("daemon: user switched elsewhere, stop"); return  // don't fight the user
+        }
+        usleep(200_000)
     }
+    fdbg("daemon: deadline reached")
 }
 
 // MARK: - Contacts
@@ -227,6 +278,13 @@ let argv = Array(CommandLine.arguments.dropFirst())
 func fail(_ m: String) -> Never { FileHandle.standardError.write((m + "\n").data(using: .utf8)!); exit(1) }
 guard let cmd = argv.first else { fail("usage: teams read|send …") }
 let rest = Array(argv.dropFirst())
+
+// Internal: detached focus-restore helper spawned by restoreFocus (not user-facing).
+if cmd == "__refocus" {
+    refocusDaemon(prevPid: Int32(rest.first ?? "") ?? -1, openArgs: Array(rest.dropFirst()))
+    exit(0)
+}
+
 let prevApp = NSWorkspace.shared.frontmostApplication
 
 switch cmd {
