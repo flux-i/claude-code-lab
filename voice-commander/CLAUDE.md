@@ -102,7 +102,11 @@ By default `voice-agent.sh` blocks on `claude -p --output-format json` and print
 | `RESULT\t<text>` | the final answer |
 | `SID\t<id>` | session id (internal) |
 
-A `jq` filter turns Claude's event stream into these lines: an assistant turn that also calls a tool has interstitial narration (→ `SAY`); a text-only assistant turn is the final answer (skipped — it arrives as `result`). **Default mode is unchanged**, so the current app keeps working; streaming is consumed by the app only after the planned `main.swift` integration (read the protocol → `AVAudioPlayer` queue + HUD via `/tts_stream`, plus key-press **barge-in**: stop speaking, listen, send, resume). Test it from the CLI by piping `VOICE_STREAM=1 voice-agent.sh "…"` into a speaker harness.
+A `jq` filter turns Claude's event stream into these lines: an assistant turn that also calls a tool has interstitial narration (→ `SAY`); a text-only assistant turn is the final answer (skipped — it arrives as `result`). **Default mode is unchanged**, so the script stays CLI-testable: pipe `VOICE_STREAM=1 voice-agent.sh "…"` into a speaker harness.
+
+**The app consumes this protocol (`main.swift`).** `runClaude` launches the agent with `VOICE_STREAM=1`, reads stdout **line by line as it streams**, and feeds each `SAY/TOOL/ALERT/RESULT` into a **speech queue** (`enqueueSpeech` → `playNextInQueue` → `speakSegment`) that speaks one segment at a time via the neural server, advancing on each `audioPlayerDidFinishPlaying`. The final answer is split into sentences client-side (`splitSentences`, `.bySentences`) and enqueued piece-by-piece, so the reply streams without needing the framed `/tts_stream` endpoint. An immediate `"On it."` ack is enqueued at send so silence breaks at once (the first model narration can be ~10s out). Orb: violet (`.thinking`) while waiting on the agent, green (`.done`) while a segment plays.
+
+**Barge-in.** Press the hotkey while a response is thinking or speaking and `startRecording` calls `cancelCurrentOperation()` — it `terminate()`s the in-flight agent, stops audio, clears the queue, and bumps a **`runID`** generation token so any late callbacks from the old turn are dropped — then starts a fresh listen. Releasing the key sends the new command, and the response voice resumes via the queue. Every async callback (`dispatchProtocolLine`, `speakSegment` completion, agent exit) guards on `myID == runID` so a superseded turn can never leak audio into the new one.
 
 ## Deployment
 

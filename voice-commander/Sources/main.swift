@@ -253,6 +253,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     private var didRun = false
     private var transcript = ""
 
+    // Streaming response state
+    private var agentProc: Process?           // in-flight voice-agent.sh (killed on barge-in)
+    private var speechQueue: [String] = []    // segments waiting to be spoken, in order
+    private var isSpeaking = false            // a segment is currently playing
+    private var agentRunning = false          // the agent process is still producing output
+    private var gotResult = false             // a RESULT line arrived this turn
+    private var runID = 0                     // bumped each turn; stale callbacks are dropped
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         hud = HUDController(state: state)
@@ -371,6 +379,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     // MARK: Recording
     private func startRecording() {
         guard !isRecording else { return }
+        // Barge-in: pressing the key mid-response (thinking or speaking) cancels it and
+        // starts a fresh listen. The new command runs once you release the key.
+        if agentRunning || isSpeaking || !speechQueue.isEmpty { cancelCurrentOperation() }
         guard let recognizer = recognizer, recognizer.isAvailable else {
             flash(.error, error: "Speech recognition isn't ready yet."); return
         }
@@ -451,38 +462,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
         }
     }
 
-    // MARK: Execution (delegates to the session-aware shell agent)
+    // MARK: Execution (session-aware shell agent, STREAMING)
+    //
+    // Runs voice-agent.sh with VOICE_STREAM=1 and reads its tab-delimited line
+    // protocol (SAY/TOOL/ALERT/RESULT) AS IT STREAMS, queuing each piece to speak —
+    // so Claude talks you through long tasks instead of leaving you in silence.
     private func runClaude(_ text: String) {
+        runID &+= 1
+        let myID = runID
+        agentRunning = true
+        gotResult = false
+        speechQueue.removeAll()
+        isSpeaking = false
+        enqueueSpeech("On it.")        // instant ack — the first model narration can be ~10s out
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: self.agentPath)
             proc.arguments = [text]
+            var env = ProcessInfo.processInfo.environment
+            env["VOICE_STREAM"] = "1"
+            proc.environment = env
             let out = Pipe(); proc.standardOutput = out
-            proc.standardError = Pipe()
+            proc.standardError = FileHandle.nullDevice   // agent logs its own errors to agent.err
+            DispatchQueue.main.async { if myID == self.runID { self.agentProc = proc } }
 
             do { try proc.run() }
             catch {
-                DispatchQueue.main.async { self.flash(.error, error: error.localizedDescription) }
+                DispatchQueue.main.async {
+                    guard myID == self.runID else { return }
+                    self.agentRunning = false
+                    self.flash(.error, error: error.localizedDescription)
+                }
                 return
             }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let reply = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let code = proc.terminationStatus
 
-            DispatchQueue.main.async {
-                if code == 0 && !reply.isEmpty {
-                    self.state.phase = .done     // green orb, no label; text streams with speech
-                    self.setMenuState("Idle")
-                    self.setBarSymbol("mic", tint: nil)
-                    self.speak(reply)            // HUD streams the words, then fades when speech ends
-                    self.hud.hide(after: 90.0)   // safety, in case speech never finishes
-                } else {
-                    self.flash(.error, error: reply.isEmpty ? "No response from Claude." : reply)
+            // Read line by line (newline-delimited) so we act on each event immediately.
+            let handle = out.fileHandleForReading
+            var buffer = Data()
+            while true {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break }                  // EOF
+                buffer.append(chunk)
+                while let nl = buffer.firstIndex(of: 0x0A) {
+                    let lineData = Data(buffer[buffer.startIndex..<nl])
+                    buffer = Data(buffer[buffer.index(after: nl)...])
+                    self.dispatchProtocolLine(lineData, runID: myID)
                 }
             }
+            if !buffer.isEmpty { self.dispatchProtocolLine(buffer, runID: myID) }
+
+            proc.waitUntilExit()
+            let code = proc.terminationStatus
+            DispatchQueue.main.async {
+                guard myID == self.runID else { return }    // a newer turn superseded this one
+                self.agentProc = nil
+                self.agentRunning = false
+                self.onAgentFinished(code: code)
+            }
         }
+    }
+
+    /// Parse one `TAG\ttext` protocol line and queue speech for it (on the main thread,
+    /// dropping anything from a superseded turn).
+    private func dispatchProtocolLine(_ data: Data, runID myID: Int) {
+        guard let raw = String(data: data, encoding: .utf8) else { return }
+        let line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
+        guard let tab = line.firstIndex(of: "\t") else { return }
+        let tag = String(line[..<tab])
+        let text = String(line[line.index(after: tab)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        DispatchQueue.main.async {
+            guard myID == self.runID else { return }
+            switch tag {
+            case "ALERT", "SAY", "TOOL":
+                self.enqueueSpeech(text)
+            case "RESULT":
+                self.gotResult = true
+                for s in self.splitSentences(text) { self.enqueueSpeech(s) }
+            default:
+                break                                        // SID and anything else: ignore
+            }
+        }
+    }
+
+    /// Agent process exited. Surface an error if nothing useful came back; otherwise let
+    /// the speech queue finish and wrap up when it drains.
+    private func onAgentFinished(code: Int32) {
+        if code != 0 && !gotResult {
+            cancelCurrentOperation()
+            flash(.error, error: "No response from Claude.")
+            return
+        }
+        if !isSpeaking && speechQueue.isEmpty { finishResponse() }
+    }
+
+    private func finishResponse() {
+        setMenuState("Idle")
+        setBarSymbol("mic", tint: nil)
+        hud.hide(after: 1.2)
+    }
+
+    /// Barge-in / interrupt: kill any in-flight agent + audio, drop the queue, and
+    /// invalidate pending callbacks (via runID) so nothing from the old turn leaks in.
+    private func cancelCurrentOperation() {
+        runID &+= 1
+        agentProc?.terminate()
+        agentProc = nil
+        agentRunning = false
+        speechQueue.removeAll()
+        isSpeaking = false
+        synth.stopSpeaking(at: .immediate)
+        audioPlayer?.stop()
+        audioPlayer = nil
+        karaokeTimer?.invalidate()
+        state.stream = ""
     }
 
     // MARK: Text-to-speech (Claude speaks its reply back, words streamed to the HUD)
@@ -490,21 +585,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     // Primary path is the neural Chatterbox server: POST the text, play the returned
     // WAV, and drive the karaoke window off the clip's duration. If the server isn't
     // reachable (still loading, not installed), fall back to the system synthesizer.
+    /// One-off speak (menu actions, demo): replace anything in flight with this.
     private func speak(_ text: String) {
-        DispatchQueue.main.async {
-            self.synth.stopSpeaking(at: .immediate)
-            self.audioPlayer?.stop()
-            self.audioPlayer = nil
-            self.karaokeTimer?.invalidate()
-            self.state.stream = ""
+        cancelCurrentOperation()
+        enqueueSpeech(text)
+    }
+
+    /// Queue a segment; start playing if nothing is currently speaking.
+    private func enqueueSpeech(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        speechQueue.append(t)
+        if !isSpeaking { playNextInQueue() }
+    }
+
+    private func playNextInQueue() {
+        guard !speechQueue.isEmpty else {
+            isSpeaking = false
+            if agentRunning { state.phase = .thinking }   // violet while waiting for more
+            else { finishResponse() }                     // all said and agent done
+            return
         }
+        isSpeaking = true
+        state.phase = .done                               // green "speaking" orb
+        hud.show()
+        speakSegment(speechQueue.removeFirst())
+    }
+
+    /// Synthesize + play ONE segment via the neural server; advance the queue on finish.
+    private func speakSegment(_ text: String) {
+        let myID = runID
+        synth.stopSpeaking(at: .immediate)
+        audioPlayer?.stop(); audioPlayer = nil
+        karaokeTimer?.invalidate()
         requestNeuralSpeech(text) { [weak self] data in
             guard let self = self else { return }
             DispatchQueue.main.async {
+                guard myID == self.runID else { return }   // turn superseded mid-synth
                 if let data = data, self.playNeural(data, text: text) { return }
-                self.speakSystem(text)   // graceful fallback to Apple TTS
+                self.speakSystem(text)                      // graceful fallback to Apple TTS
             }
         }
+    }
+
+    /// A segment finished playing — move to the next (or wrap up).
+    private func segmentFinished() {
+        karaokeTimer?.invalidate()
+        playNextInQueue()
+    }
+
+    /// Split a final answer into sentence-sized pieces so each plays as soon as it's
+    /// synthesized — client-side streaming of the reply, mirroring the server's split.
+    private func splitSentences(_ text: String) -> [String] {
+        let clean = text.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return [] }
+        var out: [String] = []
+        clean.enumerateSubstrings(in: clean.startIndex..<clean.endIndex, options: .bySentences) { sub, _, _, _ in
+            if let s = sub?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { out.append(s) }
+        }
+        return out.isEmpty ? [clean] : out
     }
 
     /// Ask the Chatterbox server for speech audio; nil on any failure (→ fallback).
@@ -561,8 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        karaokeTimer?.invalidate()
-        hud.hide(after: 1.2)
+        segmentFinished()
     }
 
     /// Apple's on-device synthesizer — fallback when the neural server isn't ready.
@@ -635,10 +774,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDel
     }
 
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        hud.hide(after: 1.2)
+        segmentFinished()
     }
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        hud.hide(after: 1.2)
+        // Deliberate stop (next segment / barge-in) — do NOT advance the queue here.
     }
 
     private func flash(_ phase: Phase, error: String) {
