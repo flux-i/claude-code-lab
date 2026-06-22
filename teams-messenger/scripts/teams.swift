@@ -38,7 +38,7 @@ func collect(_ el: AXUIElement, max: Int = 80_000, _ pred: (AXUIElement, String)
 }
 
 // MARK: - CGEvent keyboard (used only on the attachment / fallback path)
-let VK_A: CGKeyCode = 0, VK_V: CGKeyCode = 9, VK_DEL: CGKeyCode = 51, VK_RET: CGKeyCode = 36
+let VK_A: CGKeyCode = 0, VK_V: CGKeyCode = 9, VK_DEL: CGKeyCode = 51, VK_RET: CGKeyCode = 36, VK_2: CGKeyCode = 19
 func tapKey(_ vk: CGKeyCode, _ flags: CGEventFlags = []) {
     let src = CGEventSource(stateID: .hidSystemState)
     let d = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: true); d?.flags = flags; d?.post(tap: .cghidEventTap)
@@ -46,6 +46,7 @@ func tapKey(_ vk: CGKeyCode, _ flags: CGEventFlags = []) {
     usleep(60_000)
 }
 func typeUnicode(_ text: String) {
+    if text.isEmpty { return }                     // virtualKey:0 with no unicode string types a literal "A"
     let src = CGEventSource(stateID: .hidSystemState)
     var u16 = Array(text.utf16)
     let d = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
@@ -53,6 +54,18 @@ func typeUnicode(_ text: String) {
     let u = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
     u?.keyboardSetUnicodeString(stringLength: u16.count, unicodeString: &u16); u?.post(tap: .cghidEventTap)
     usleep(80_000)
+}
+// Type a possibly-multi-line message. A raw "\n" typed as a unicode char is treated by the
+// Teams compose box as ENTER (it sends, or collapses blank lines) — so we type each line as
+// text and insert line breaks with SHIFT+RETURN, which is Teams' "new line, don't send".
+// Blank lines are empty segments → a lone Shift+Return, preserving paragraph spacing.
+func typeMultiline(_ text: String) {
+    let lines = text.components(separatedBy: "\n")
+    for (i, line) in lines.enumerated() {
+        typeUnicode(line)
+        if i < lines.count - 1 { tapKey(VK_RET, .maskShift); usleep(40_000) }
+    }
+    usleep(220_000)
 }
 
 // MARK: - Teams app/window
@@ -77,11 +90,21 @@ func teamsApp() -> NSRunningApplication? {
     }) { return nonHelper }
     return apps.first(where: isTeamsApp)
 }
+// Turn on Teams' accessibility tree. AXManualAccessibility alone is usually enough, but
+// after the Electron renderer reloads (or has run a long time) the tree can go EMPTY —
+// 0 text areas, 0 message text — even on a normal Chat view, and the app gets stuck on
+// whatever tab it was on. Setting AXEnhancedUserInterface (the flag a screen reader sets)
+// forces Chromium to rebuild the full tree; empirically this both restores the tree and
+// un-sticks the view. We assert both, every time.
+func enableAX(_ appEl: AXUIElement) {
+    AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+}
 func waitForWindow(_ tries: Int = 28) -> (NSRunningApplication, AXUIElement, AXUIElement)? {
     for _ in 0..<tries {
         if let app = teamsApp() {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            enableAX(appEl)
             if let wins = axAttr(appEl, kAXWindowsAttribute as String) as? [AXUIElement], let w = wins.first {
                 return (app, appEl, w)
             }
@@ -224,10 +247,11 @@ func parseRecipients(_ s: String) -> [String] {
 }
 
 // MARK: - Navigation (background, no focus steal)
-func openChat(_ emails: [String], message: String? = nil) {
-    var u = "msteams:/l/chat/0/0?users=\(emails.joined(separator: ","))"
-    if let m = message, let enc = m.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) { u += "&message=\(enc)" }
-    guard let url = URL(string: u) else { return }
+// Open the 1:1/group chat for these users. We deliberately do NOT use the deep link's
+// &message= prefill anymore — it's ignored when the chat is already open, appends to any
+// existing draft, and mangles multi-line text. The message is typed in instead (sendOne).
+func openChat(_ emails: [String]) {
+    guard let url = URL(string: "msteams:/l/chat/0/0?users=\(emails.joined(separator: ","))") else { return }
     let cfg = NSWorkspace.OpenConfiguration(); cfg.activates = false
     let sem = DispatchSemaphore(value: 0)
     NSWorkspace.shared.open(url, configuration: cfg) { _, _ in sem.signal() }
@@ -260,22 +284,6 @@ func pressSend(_ appEl: AXUIElement) -> Bool {
     return AXUIElementPerformAction(send, kAXPressAction as CFString) == .success
 }
 func needleOf(_ message: String) -> String { String(message.prefix(18)) }
-func prefilled(_ appEl: AXUIElement, _ message: String) -> Bool {
-    guard let win = firstWindow(appEl) else { return false }
-    return composeValue(win).contains(needleOf(message))
-}
-// Poll for the deep-link &message= prefill to actually land. The prefill is async and a
-// slow one used to arrive AFTER a fixed sleep, so the code fell through to the typing
-// path and the late prefill then duplicated the message. Polling removes that race.
-func waitPrefilled(_ appEl: AXUIElement, _ message: String, _ maxMs: Int = 4000) -> Bool {
-    let needle = needleOf(message)
-    var waited = 0
-    while waited < maxMs {
-        if let win = firstWindow(appEl), composeValue(win).contains(needle) { return true }
-        usleep(200_000); waited += 200
-    }
-    return false
-}
 // The compose AXTextArea (first text area in the window).
 func composeArea(_ appEl: AXUIElement) -> AXUIElement? {
     guard let win = firstWindow(appEl) else { return nil }
@@ -302,16 +310,29 @@ func clearCompose(_ appEl: AXUIElement) {
         tapKey(VK_A, .maskCommand); tapKey(VK_DEL); usleep(180_000)
     }
 }
-// Type the message so it lands EXACTLY once: focus, clear, type, verify a single
-// occurrence; if it's missing (focus failed) or doubled, retry. Returns false if it
-// never lands cleanly — so the caller reports an honest failure instead of "Sent".
-func typeMessageVerified(_ app: NSRunningApplication, _ appEl: AXUIElement, _ message: String) -> Bool {
+// Put text on the pasteboard and ⌘V it into the focused compose box. Pasting is the
+// faithful way to enter a message: it preserves newlines AND blank lines, never triggers
+// a send (unlike a raw typed "\n"), and handles every character (incl. "&", emoji) without
+// URL-encoding pitfalls. The user's clipboard is saved and restored.
+func pasteText(_ text: String) {
+    let pb = NSPasteboard.general
+    let saved = pb.string(forType: .string)
+    pb.clearContents(); pb.setString(text, forType: .string)
+    tapKey(VK_V, .maskCommand); usleep(350_000)
+    if let s = saved { pb.clearContents(); pb.setString(s, forType: .string) }   // best-effort restore
+}
+// Put the message into the compose box EXACTLY once: focus, clear, enter, verify a single
+// occurrence; retry if it's missing (focus failed) or doubled. Pastes first (preserves
+// formatting); if a paste won't land, falls back to typed entry. Returns false if it never
+// lands cleanly — so the caller reports an honest failure instead of "Sent".
+func enterMessageVerified(_ app: NSRunningApplication, _ appEl: AXUIElement, _ message: String) -> Bool {
     guard !message.isEmpty else { return true }
     let needle = needleOf(message)
-    for _ in 0..<3 {
+    for attempt in 0..<3 {
         focusCompose(app, appEl)
         clearCompose(appEl)
-        typeUnicode(message); usleep(300_000)
+        if attempt < 2 { pasteText(message) } else { typeMultiline(message) }   // paste, paste, then typed fallback
+        usleep(300_000)
         if let win = firstWindow(appEl), composeValue(win).components(separatedBy: needle).count - 1 == 1 { return true }
     }
     return false
@@ -336,13 +357,35 @@ func pasteImage(_ path: String) -> Bool {
     tapKey(VK_V, .maskCommand); usleep(1_500_000); return true
 }
 
-// One send. Text-only takes the fast prefill-on-navigation path; if the chat is already
-// open (prefill ignored) the prefill silently does nothing, so we type the message in.
-// Either way Teams foregrounds itself on the nav, so the keystrokes land in its compose
-// box — no activate()/⌘R needed (⌘R reloads the Teams renderer and corrupts the draft).
-// Every path verifies: typed exactly once (no double-paste) and the box emptied on send
-// (so we never report "Sent" while the text just sits there). Focus is restored by the
-// caller afterwards (restoreFocus).
+// Make sure Teams is on the CHAT view with a live accessibility tree. ⌘2 is Teams'
+// "go to Chat" shortcut — it rescues us when the window is stuck on Calendar (or another
+// tab), which otherwise leaves no compose box to type into. The shortcut only lands if
+// Teams is frontmost, so call this AFTER a nav has foregrounded it. We also re-assert the
+// AX flags because switching tabs can rebuild the renderer.
+func ensureChatView(_ app: NSRunningApplication, _ appEl: AXUIElement) {
+    app.activate(); usleep(250_000)
+    tapKey(VK_2, .maskCommand); usleep(350_000)                      // ⌘2 → Chat
+    enableAX(appEl); usleep(200_000)
+}
+// Wait until the compose text area is present. The tree can lag after a nav/tab switch,
+// and AXEnhancedUserInterface (re-asserted each tick) is what coaxes Teams into exposing
+// it when the renderer has gone quiet.
+func waitForCompose(_ appEl: AXUIElement, _ maxMs: Int = 5000) -> Bool {
+    var waited = 0
+    while waited < maxMs {
+        enableAX(appEl)
+        if composeArea(appEl) != nil { return true }
+        usleep(250_000); waited += 250
+    }
+    return false
+}
+
+// One send. We ALWAYS drive the compose box directly (clear → type → verify → send →
+// verify) rather than the deep-link &message= prefill: the prefill is silently ignored
+// when the chat is already open, APPENDS to an existing draft (messages stacked up), and
+// mangles multi-line text. Typing with Shift+Return line breaks is reliable for one-line
+// and multi-line alike. Teams foregrounds itself on the nav; we then force the Chat view
+// (⌘2) and wait for the tree. Focus is restored by the caller afterwards (restoreFocus).
 func sendOne(_ emails: [String], message: String, attach: String?, dry: Bool) -> String {
     let who = emails.joined(separator: ", ")
     guard let (app, appEl, _) = waitForWindow() else { return "Teams window not found." }
@@ -352,32 +395,22 @@ func sendOne(_ emails: [String], message: String, attach: String?, dry: Bool) ->
            : "Prepared for \(who)\(suffix) but Send didn't register — message left in compose, NOT sent."
     }
 
-    if attach == nil {
-        openChat(emails, message: message)                            // navigate + prefill (Teams foregrounds)
-        if waitPrefilled(appEl, message) {                            // prefill landed (chat wasn't already open)
-            if dry { return "DRY: prefilled for \(who) — NOT sent." }
-            return sentReport(sendVerified(appEl))
-        }
-        // Prefill ignored (chat already open) → type it in, verified single occurrence.
-        if !typeMessageVerified(app, appEl, message) {
-            return "Couldn't enter the message into Teams for \(who) — NOT sent."
-        }
-        if dry { return "DRY: typed for \(who) — NOT sent." }
-        return sentReport(sendVerified(appEl))
+    openChat(emails)                                                  // foreground Teams + open the chat
+    ensureChatView(app, appEl)                                        // ⌘2 un-sticks Calendar / kicks the tree
+    openChat(emails)                                                  // re-assert the target chat under the Chat tab
+    guard waitForCompose(appEl) else {
+        return "Couldn't open a chat compose box for \(who) (Teams accessibility not ready) — NOT sent."
     }
 
-    // Attachment path: open the chat, then type the caption and paste the image into the
-    // now-foreground compose box (the ⌘V paste needs the compose box focused).
-    openChat(emails); usleep(1_200_000)
-    focusCompose(app, appEl)
-    clearCompose(appEl)                                               // start clean even with an empty caption
-    if !typeMessageVerified(app, appEl, message) {                    // no-op (true) when caption is empty
-        return "Couldn't enter the caption into Teams for \(who) — NOT sent."
+    if !enterMessageVerified(app, appEl, message) {                   // clears first, pastes once, verifies
+        return "Couldn't enter the message into Teams for \(who) — NOT sent."
     }
-    focusCompose(app, appEl)                                          // re-assert focus before the paste
-    if let path = attach, !pasteImage(path) { return "Could not load image: \(path)" }
-    if dry { return "DRY: typed + attached for \(who) — NOT sent." }
-    return sentReport(sendVerified(appEl), " (with attachment)")
+    if let path = attach {
+        focusCompose(app, appEl)                                      // ⌘V paste needs the compose box focused
+        if !pasteImage(path) { return "Could not load image: \(path)" }
+    }
+    if dry { return "DRY: staged for \(who)\(attach != nil ? " + attachment" : "") — NOT sent." }
+    return sentReport(sendVerified(appEl), attach != nil ? " (with attachment)" : "")
 }
 
 // MARK: - CLI
@@ -397,8 +430,14 @@ let prevApp = NSWorkspace.shared.frontmostApplication
 switch cmd {
 case "read":
     if let who = rest.first(where: { !$0.hasPrefix("--") }) {
-        switch resolveEmail(who) { case .success(let e): openChat([e]); usleep(1_600_000)
-                                   case .failure(let err): fail(err.message) }
+        switch resolveEmail(who) {
+        case .success(let e):
+            guard let (app, appEl, _) = waitForWindow() else { fail("Teams window not found.") }
+            openChat([e]); usleep(1_200_000)
+            ensureChatView(app, appEl)                  // ⌘2 + AX kick: don't read a stuck Calendar / empty tree
+            openChat([e]); usleep(1_400_000)
+        case .failure(let err): fail(err.message)
+        }
     }
     guard let (_, _, win) = waitForWindow() else { fail("Teams window not found.") }
     usleep(700_000)

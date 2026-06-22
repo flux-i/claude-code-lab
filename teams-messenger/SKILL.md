@@ -38,7 +38,7 @@ scripts/teams send --each "Alex, Sam and Jordan" "<message>"
 # IMAGE attachment:
 scripts/teams send "<name-or-email>" "<message>" --attach ~/path/to/image.png
 
-# DRY RUN — prepare but do NOT press Send (prefills/types only):
+# DRY RUN — stage the message in the compose box but do NOT press Send:
 scripts/teams send --dry "<name-or-email>" "<message>"
 ```
 
@@ -71,12 +71,13 @@ Multiple recipients (names or emails) may be separated by commas or the word "an
 ## Behavior & limits
 
 - **Not headless.** Any `msteams:` deep-link open makes Teams activate its *own* window (Electron pulls itself forward), so a send — or a `read` that navigates to a named chat — brings Teams to the front. The binary **restores focus** to the app you were using and returns you there. On macOS 26 this is non-trivial: Teams self-activates *asynchronously*, often just after the CLI would exit, and a background CLI cannot reorder apps via `NSRunningApplication.activate()`/`.hide()` or the Accessibility API (all ignored). So restore is done by a **detached helper** (`teams __refocus`, spawned automatically) that outlives the command, waits for Teams' late grab, and re-opens the previous app via LaunchServices (`/usr/bin/open`) — which works with no extra permission. The result is printed before this kicks off, so the command returns immediately while focus is fixed in the background. It only ever reclaims focus *from Teams* (won't fight you if you switch elsewhere).
-- **Text injection:** when navigating, the message is injected via the deep-link `&message=` prefill (atomic, no per-keystroke failures); the binary polls until the prefill actually lands. If the target chat is already open the prefill is silently ignored, so it focuses the compose box via the Accessibility API and types the message, verifying it landed **exactly once** (clears first, so an existing draft is never duplicated). **Send** is an Accessibility press on the Send button (falls back to Return), and it confirms the compose box emptied — if it didn't, the result is reported as **NOT sent** rather than a false "Sent".
-- **Attachments:** images work (pasted via the pasteboard, which needs Teams briefly focused). Arbitrary files (PDF/zip) are **not yet supported**.
+- **Chat view + accessibility:** before entering text the binary forces Teams onto the **Chat** view with `⌘2` and asserts both `AXManualAccessibility` and `AXEnhancedUserInterface`. The latter matters: after the Electron renderer reloads (or runs a long time) Teams' accessibility tree can go **empty** (no compose box, no messages) and the window gets stuck on whatever tab it was on — `AXEnhancedUserInterface` forces Chromium to rebuild the tree, which both restores it and un-sticks the view. It then waits for the compose box to actually appear before acting.
+- **Text injection:** the message is entered by **pasting** it (clipboard + `⌘V`) into the focused compose box — paste preserves newlines, never triggers a premature send (a raw typed `\n` would), and handles every character (incl. `&`, emoji) with no URL-encoding pitfalls; the clipboard is saved and restored. It clears the box first and verifies the text landed **exactly once** (an existing draft is never duplicated), with a typed fallback if paste won't land. The old deep-link `&message=` prefill is no longer used (it was ignored on already-open chats, appended to drafts, and mangled multi-line text). **Send** is an Accessibility press on the Send button (falls back to Return) and confirms the compose box emptied — if it didn't, the result is reported as **NOT sent** rather than a false "Sent". *Note:* Teams' compose collapses **blank lines** between paragraphs, so multi-line messages send as consecutive lines (content/links are preserved).
+- **Attachments:** images work (pasted via the pasteboard, which needs the compose box focused). Arbitrary files (PDF/zip) are **not yet supported**.
 - Requires macOS **Accessibility permission** for the controlling terminal (System Settings → Privacy & Security → Accessibility), and the **Teams desktop app** installed and signed in.
 
 ## Troubleshooting
 
 - **Keystrokes/clicks do nothing** → grant Accessibility permission to the controlling terminal, then retry.
-- **Message didn't appear in the chat** → the compose box wasn't focused or the prefill was ignored; confirm the right chat opened.
+- **Message didn't appear in the chat** → the compose box wasn't focused, or Teams' accessibility tree was empty/stuck on another tab; the binary reports **NOT sent** in that case. Re-run; if it persists, restart the Teams desktop app.
 - **Wrong person / chat didn't open** → the resolved email may not match a real user; verify it in `teams_contacts.txt`.
