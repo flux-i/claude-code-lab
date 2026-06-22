@@ -38,7 +38,7 @@ func collect(_ el: AXUIElement, max: Int = 80_000, _ pred: (AXUIElement, String)
 }
 
 // MARK: - CGEvent keyboard (used only on the attachment / fallback path)
-let VK_R: CGKeyCode = 15, VK_A: CGKeyCode = 0, VK_V: CGKeyCode = 9, VK_DEL: CGKeyCode = 51, VK_RET: CGKeyCode = 36
+let VK_A: CGKeyCode = 0, VK_V: CGKeyCode = 9, VK_DEL: CGKeyCode = 51, VK_RET: CGKeyCode = 36
 func tapKey(_ vk: CGKeyCode, _ flags: CGEventFlags = []) {
     let src = CGEventSource(stateID: .hidSystemState)
     let d = CGEvent(keyboardEventSource: src, virtualKey: vk, keyDown: true); d?.flags = flags; d?.post(tap: .cghidEventTap)
@@ -56,8 +56,26 @@ func typeUnicode(_ text: String) {
 }
 
 // MARK: - Teams app/window
+// True for ANY Teams process — the main app AND its helpers (WebView, Notification
+// Center). New Teams runs ~5 of them, all named "Microsoft Teams …"; whichever owns the
+// front window varies, so focus logic must treat them all as "Teams is up front".
+func isTeamsApp(_ a: NSRunningApplication?) -> Bool {
+    guard let a = a else { return false }
+    return (a.bundleIdentifier ?? "").hasPrefix("com.microsoft.teams")
+        || (a.localizedName ?? "").hasPrefix("Microsoft Teams")
+}
+// The MAIN Teams app (the one that owns the chat window). Must NOT return a helper —
+// helpers have no windows, which would break waitForWindow. Pick the exact main bundle
+// id; fall back to the first non-helper, then anything Teams-ish.
 func teamsApp() -> NSRunningApplication? {
-    NSWorkspace.shared.runningApplications.first { ($0.localizedName ?? "").hasPrefix("Microsoft Teams") }
+    let apps = NSWorkspace.shared.runningApplications
+    if let main = apps.first(where: { $0.bundleIdentifier == "com.microsoft.teams2" || $0.bundleIdentifier == "com.microsoft.teams" }) { return main }
+    if let nonHelper = apps.first(where: { a in
+        guard isTeamsApp(a) else { return false }
+        let b = a.bundleIdentifier ?? ""
+        return !b.contains("helper") && !b.contains("notificationcenter") && !b.contains("webview")
+    }) { return nonHelper }
+    return apps.first(where: isTeamsApp)
 }
 func waitForWindow(_ tries: Int = 28) -> (NSRunningApplication, AXUIElement, AXUIElement)? {
     for _ in 0..<tries {
@@ -75,11 +93,17 @@ func waitForWindow(_ tries: Int = 28) -> (NSRunningApplication, AXUIElement, AXU
 func firstWindow(_ appEl: AXUIElement) -> AXUIElement? {
     (axAttr(appEl, kAXWindowsAttribute as String) as? [AXUIElement])?.first
 }
+// Current text in the compose box. When the box is empty the AXTextArea reports its
+// PLACEHOLDER ("Type a message") as its value, not "" — treat that as empty, otherwise
+// prefill-detection and clear/sent verification all misfire.
+let COMPOSE_PLACEHOLDER = "Type a message"
 func composeValue(_ win: AXUIElement) -> String {
     var f: [AXUIElement] = []
     collect(win, { _, r in r == "AXTextArea" }, &f)
-    return (f.first.map { axStr($0, kAXValueAttribute as String) } ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let v = (f.first.map { axStr($0, kAXValueAttribute as String) } ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    return v == COMPOSE_PLACEHOLDER ? "" : v
 }
+func composeEmpty(_ appEl: AXUIElement) -> Bool { firstWindow(appEl).map { composeValue($0).isEmpty } ?? false }
 
 // Bring the user's previously-active app back to the front. On macOS 26 a background
 // CLI tool CANNOT foreground another app via NSRunningApplication.activate() OR .hide()
@@ -108,7 +132,7 @@ func fdbg(_ s: String) { if FOCUS_DEBUG { FileHandle.standardError.write(("[focu
 // focus is corrected in the background (no added latency).
 func restoreFocus(_ app: NSRunningApplication?) {
     guard let app = app else { return }
-    if let t = teamsApp(), t.processIdentifier == app.processIdentifier { return }  // user was in Teams
+    if isTeamsApp(app) { return }                                  // user was already in Teams — leave it
     var openArgs: [String] = []
     if let url = app.bundleURL { openArgs = [url.path] }            // most robust
     else if let bid = app.bundleIdentifier { openArgs = ["-b", bid] }
@@ -125,26 +149,33 @@ func restoreFocus(_ app: NSRunningApplication?) {
 // Detached helper (run as `teams __refocus <prevPid> <open-args…>`): watch for Teams'
 // late self-activation and bring the previous app back via `/usr/bin/open`. Claws focus
 // back ONLY from Teams (never from a third app the user may have deliberately switched
-// to), stops once that app is stably front, and gives up after a few seconds.
+// to), stops once that app is stably front, and gives up after a while.
+//
+// Teams is identified by IDENTITY (isTeamsApp), NOT by pid-equality with teamsApp():
+// new Teams runs ~5 processes ("Microsoft Teams", "… WebView", "… Notification Center")
+// and any of them can own the front window. The old pid check matched only one of them,
+// so when a different Teams process was frontmost the daemon mistook it for a third app
+// and quit, stranding the user in Teams. A genuine third-app switch is only honored after
+// it stays front a beat (so a transient frontmost during the `open` doesn't end it early).
 func refocusDaemon(prevPid: Int32, openArgs: [String]) {
     setsid()                                        // detach from the parent's session/group
     guard prevPid > 0, !openArgs.isEmpty else { return }
-    let deadline = Date().addingTimeInterval(8)
-    var sawTeams = false, stable = 0
+    let deadline = Date().addingTimeInterval(12)
+    var sawTeams = false, prevStable = 0, otherStable = 0
     while Date() < deadline {
-        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let teamsPid = teamsApp()?.processIdentifier
-        if let fp = frontPid, fp == teamsPid {                      // Teams grabbed → claw back
-            sawTeams = true; stable = 0
+        let front = NSWorkspace.shared.frontmostApplication
+        if isTeamsApp(front) {                                      // any Teams process grabbed → claw back
+            sawTeams = true; prevStable = 0; otherStable = 0
             let t = Process(); t.executableURL = URL(fileURLWithPath: "/usr/bin/open"); t.arguments = openArgs
             try? t.run(); t.waitUntilExit()
             fdbg("daemon: clawed back from Teams")
-        } else if frontPid == prevPid {                            // sitting on the previous app
-            stable += 1
-            if sawTeams && stable >= 4 { fdbg("daemon: prev stable, done"); return }     // ~0.8s after claw-back
-            if !sawTeams && stable >= 12 { fdbg("daemon: teams never fronted, done"); return } // ~2.4s, no steal
-        } else {
-            fdbg("daemon: user switched elsewhere, stop"); return  // don't fight the user
+        } else if front?.processIdentifier == prevPid {            // sitting on the previous app
+            prevStable += 1; otherStable = 0
+            if sawTeams && prevStable >= 5 { fdbg("daemon: prev stable, done"); return }     // ~1s after claw-back
+            if !sawTeams && prevStable >= 12 { fdbg("daemon: teams never fronted, done"); return } // ~2.4s, no steal
+        } else {                                                   // some third app is front
+            otherStable += 1; prevStable = 0
+            if otherStable >= 8 { fdbg("daemon: user switched elsewhere, stop"); return }   // ~1.6s stable → don't fight
         }
         usleep(200_000)
     }
@@ -228,10 +259,73 @@ func pressSend(_ appEl: AXUIElement) -> Bool {
     guard let win = firstWindow(appEl), let send = findButton(win, prefix: "Send") else { return false }
     return AXUIElementPerformAction(send, kAXPressAction as CFString) == .success
 }
+func needleOf(_ message: String) -> String { String(message.prefix(18)) }
 func prefilled(_ appEl: AXUIElement, _ message: String) -> Bool {
     guard let win = firstWindow(appEl) else { return false }
-    let needle = String(message.prefix(18))
-    return composeValue(win).contains(needle)
+    return composeValue(win).contains(needleOf(message))
+}
+// Poll for the deep-link &message= prefill to actually land. The prefill is async and a
+// slow one used to arrive AFTER a fixed sleep, so the code fell through to the typing
+// path and the late prefill then duplicated the message. Polling removes that race.
+func waitPrefilled(_ appEl: AXUIElement, _ message: String, _ maxMs: Int = 4000) -> Bool {
+    let needle = needleOf(message)
+    var waited = 0
+    while waited < maxMs {
+        if let win = firstWindow(appEl), composeValue(win).contains(needle) { return true }
+        usleep(200_000); waited += 200
+    }
+    return false
+}
+// The compose AXTextArea (first text area in the window).
+func composeArea(_ appEl: AXUIElement) -> AXUIElement? {
+    guard let win = firstWindow(appEl) else { return nil }
+    var f: [AXUIElement] = []
+    collect(win, { _, r in r == "AXTextArea" }, &f)
+    return f.first
+}
+// Focus the compose box for keystroke entry. After a deep-link nav Teams is already the
+// frontmost app (it self-activates), but the compose box itself may not hold keyboard
+// focus — so we assert AX focus on the text area (this DOES work; setting kAXValue does
+// not). activate() is a best-effort nudge in case Teams isn't quite front yet.
+func focusCompose(_ app: NSRunningApplication, _ appEl: AXUIElement) {
+    app.activate(); usleep(200_000)
+    if let ta = composeArea(appEl) {
+        AXUIElementSetAttributeValue(ta, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        usleep(150_000)
+    }
+}
+// Clear the compose box and confirm it's actually empty (⌘A+Delete can no-op if the box
+// isn't focused yet). Verified-empty before typing is what prevents the double-paste.
+func clearCompose(_ appEl: AXUIElement) {
+    for _ in 0..<6 {
+        if composeEmpty(appEl) { return }
+        tapKey(VK_A, .maskCommand); tapKey(VK_DEL); usleep(180_000)
+    }
+}
+// Type the message so it lands EXACTLY once: focus, clear, type, verify a single
+// occurrence; if it's missing (focus failed) or doubled, retry. Returns false if it
+// never lands cleanly — so the caller reports an honest failure instead of "Sent".
+func typeMessageVerified(_ app: NSRunningApplication, _ appEl: AXUIElement, _ message: String) -> Bool {
+    guard !message.isEmpty else { return true }
+    let needle = needleOf(message)
+    for _ in 0..<3 {
+        focusCompose(app, appEl)
+        clearCompose(appEl)
+        typeUnicode(message); usleep(300_000)
+        if let win = firstWindow(appEl), composeValue(win).components(separatedBy: needle).count - 1 == 1 { return true }
+    }
+    return false
+}
+// Press Send and CONFIRM the box emptied — the only reliable signal the message left the
+// compose box. Returns false if it never empties, so we can report honestly instead of
+// claiming "Sent" while the text just sits there.
+func sendVerified(_ appEl: AXUIElement) -> Bool {
+    for _ in 0..<4 {
+        if composeEmpty(appEl) { return true }      // already gone → sent
+        if !pressSend(appEl) { tapKey(VK_RET) }     // AXPress Send, else Enter
+        usleep(550_000)
+    }
+    return composeEmpty(appEl)
 }
 
 // pasteImage — put a PNG on the pasteboard and ⌘V it into the focused compose box.
@@ -242,35 +336,48 @@ func pasteImage(_ path: String) -> Bool {
     tapKey(VK_V, .maskCommand); usleep(1_500_000); return true
 }
 
-// One send. Text-only takes the fast prefill-on-navigation path; if the chat is
-// already open (prefill ignored) or there's an attachment, it types/pastes into the
-// now-foreground compose box. Teams comes briefly to the front either way — the CLI
-// restores focus afterwards (restoreFocus).
+// One send. Text-only takes the fast prefill-on-navigation path; if the chat is already
+// open (prefill ignored) the prefill silently does nothing, so we type the message in.
+// Either way Teams foregrounds itself on the nav, so the keystrokes land in its compose
+// box — no activate()/⌘R needed (⌘R reloads the Teams renderer and corrupts the draft).
+// Every path verifies: typed exactly once (no double-paste) and the box emptied on send
+// (so we never report "Sent" while the text just sits there). Focus is restored by the
+// caller afterwards (restoreFocus).
 func sendOne(_ emails: [String], message: String, attach: String?, dry: Bool) -> String {
     let who = emails.joined(separator: ", ")
     guard let (app, appEl, _) = waitForWindow() else { return "Teams window not found." }
 
-    if attach == nil {
-        openChat(emails, message: message); usleep(2_200_000)         // navigate + prefill (Teams foregrounds)
-        if prefilled(appEl, message) {
-            if dry { return "DRY: prefilled for \(who) — NOT sent." }
-            _ = pressSend(appEl); usleep(400_000)
-            return "Sent to \(who)."
-        }
-        // prefill ignored (chat already open) → fall through to the typing path
-    } else {
-        openChat(emails); usleep(1_200_000)
+    func sentReport(_ ok: Bool, _ suffix: String = "") -> String {
+        ok ? "Sent to \(who)\(suffix)."
+           : "Prepared for \(who)\(suffix) but Send didn't register — message left in compose, NOT sent."
     }
 
-    app.activate(); usleep(450_000)
-    tapKey(VK_R, .maskCommand); usleep(300_000)
-    tapKey(VK_A, .maskCommand); tapKey(VK_DEL); usleep(150_000)
-    if !message.isEmpty { typeUnicode(message); usleep(300_000) }     // type FIRST (paste steals focus)
+    if attach == nil {
+        openChat(emails, message: message)                            // navigate + prefill (Teams foregrounds)
+        if waitPrefilled(appEl, message) {                            // prefill landed (chat wasn't already open)
+            if dry { return "DRY: prefilled for \(who) — NOT sent." }
+            return sentReport(sendVerified(appEl))
+        }
+        // Prefill ignored (chat already open) → type it in, verified single occurrence.
+        if !typeMessageVerified(app, appEl, message) {
+            return "Couldn't enter the message into Teams for \(who) — NOT sent."
+        }
+        if dry { return "DRY: typed for \(who) — NOT sent." }
+        return sentReport(sendVerified(appEl))
+    }
+
+    // Attachment path: open the chat, then type the caption and paste the image into the
+    // now-foreground compose box (the ⌘V paste needs the compose box focused).
+    openChat(emails); usleep(1_200_000)
+    focusCompose(app, appEl)
+    clearCompose(appEl)                                               // start clean even with an empty caption
+    if !typeMessageVerified(app, appEl, message) {                    // no-op (true) when caption is empty
+        return "Couldn't enter the caption into Teams for \(who) — NOT sent."
+    }
+    focusCompose(app, appEl)                                          // re-assert focus before the paste
     if let path = attach, !pasteImage(path) { return "Could not load image: \(path)" }
-    if dry { return "DRY: typed\(attach != nil ? " + attached" : "") for \(who) — NOT sent." }
-    if !pressSend(appEl) { tapKey(VK_RET) }
-    usleep(400_000)
-    return "Sent to \(who)\(attach != nil ? " (with attachment)" : "")."
+    if dry { return "DRY: typed + attached for \(who) — NOT sent." }
+    return sentReport(sendVerified(appEl), " (with attachment)")
 }
 
 // MARK: - CLI
