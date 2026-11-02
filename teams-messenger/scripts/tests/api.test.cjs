@@ -122,9 +122,9 @@ test('corrupt receipts fail closed and writes have private permissions',()=>{
 });
 test('verified duplicates do not issue a POST; ambiguous attempts block retries',async()=>{
  const s=session();s.resolve=async()=>binding;const key=common.receiptKey(binding.recipient,'test');
- common.saveReceipts({[key]:{status:'verified',memberId:peer,senderId:self}});
+ common.saveReceipts({[key]:{status:'verified',recipientProof:{memberId:peer},senderId:self}});
  assert.equal((await sendText(s,binding.recipient,'test')).duplicatePrevented,true);
- common.saveReceipts({[key]:{status:'ambiguous',memberId:peer,senderId:self}});
+ common.saveReceipts({[key]:{status:'ambiguous',recipientProof:{memberId:peer},senderId:self}});
  await assert.rejects(sendText(s,binding.recipient,'test'),e=>e.code==='prior_attempt_ambiguous');
  common.saveReceipts({});
 });
@@ -135,11 +135,11 @@ test('operation lock blocks contention and releases without stale PID state',()=
  assert.match(output,/operation_in_progress/);
  assert.match(execFileSync(wrapper,['--help'],{encoding:'utf8'}),/Usage:/);
 });
-test('attachment duplicates include caption and preserve uncaptioned legacy keys',async()=>{
+test('attachment duplicates include the caption',async()=>{
  const filePath=path.join(directory,'caption.txt');fs.writeFileSync(filePath,'harmless');
  const file=await localFile(filePath),s=session();s.resolve=async()=>binding;s.resources=[];
  const key=common.fileReceiptKey(binding.recipient,file.fileName,file.contentSha256,'original caption');
- common.saveReceipts({[key]:{status:'verified',memberId:peer,senderId:self}});
+ common.saveReceipts({[key]:{status:'verified',recipientProof:{memberId:peer},senderId:self}});
  assert.equal((await sendFile(s,binding.recipient,filePath,{message:'original caption'})).duplicatePrevented,true);
  await assert.rejects(sendFile(s,binding.recipient,filePath,{message:'changed caption'}),e=>e.code==='onedrive_resource_ambiguous');
  assert.equal(common.fileReceiptKey(binding.recipient,file.fileName,file.contentSha256),common.fileReceiptKey(binding.recipient,file.fileName,file.contentSha256,''));
@@ -196,9 +196,9 @@ test('Office viewer URL is bound to the immutable file path before sharing',asyn
  api.json=async(url)=>url.includes('/root:/')?{...item,id:'another'}:item;
  await assert.rejects(api.upload(file,'unique'),e=>e.code==='file_path_not_verified');
 });
-test('legacy or other-account receipts cannot claim delivery for the current sender',async()=>{
- const s=session();s.resolve=async()=>binding;const message='legacy sender fixture',key=common.receiptKey(binding.recipient,message);
- for(const receipt of [{status:'verified',memberId:peer},{status:'verified',memberId:peer,senderId:peer}]){
+test('receipts without this sender cannot claim delivery for the current sender',async()=>{
+ const s=session();s.resolve=async()=>binding;const message='sender fixture',key=common.receiptKey(binding.recipient,message);
+ for(const receipt of [{status:'verified',recipientProof:{memberId:peer}},{status:'verified',recipientProof:{memberId:peer},senderId:peer}]){
   common.saveReceipts({[key]:receipt});await assert.rejects(sendText(s,binding.recipient,message),e=>e.code==='prior_attempt_ambiguous');
  }
  common.saveReceipts({});

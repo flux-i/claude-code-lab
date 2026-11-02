@@ -16,10 +16,9 @@ function priorReceipt(key, binding, sender, force) {
   const prior = web.loadReceipts()[key];
   if (!prior || force) return null;
   // A group is identified by its thread ID; a person by their immutable member ID.
-  const target = binding.kind === 'group' ? prior.recipientProof?.conversationId : prior.recipientProof?.memberId || prior.memberId;
+  const target = binding.kind === 'group' ? prior.recipientProof?.conversationId : prior.recipientProof?.memberId;
   const expected = binding.kind === 'group' ? binding.conversationId : binding.memberId;
-  const priorSender = prior.senderId || prior.recipientProof?.senderId;
-  if (prior.status === 'verified' && target === expected && priorSender === sender) {
+  if (prior.status === 'verified' && target === expected && prior.senderId === sender) {
     return { verified: true, duplicatePrevented: true, recipient: binding.recipient,
       transport: prior.transport || TRANSPORT, receipt: prior };
   }

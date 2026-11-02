@@ -34,9 +34,7 @@ function saveReceipts(receipts) {
 }
 function receiptKey(recipient, message) { return crypto.createHash('sha256').update(recipient + '\0' + message).digest('hex'); }
 function fileReceiptKey(recipient, name, hash, caption = '') {
-  // Preserve browser-era keys for uncaptioned attachments.
-  return crypto.createHash('sha256').update('file\0' + recipient + '\0' + name + '\0' + hash
-    + (caption ? '\0caption\0' + caption : '')).digest('hex');
+  return crypto.createHash('sha256').update('file\0' + recipient + '\0' + name + '\0' + hash + '\0caption\0' + caption).digest('hex');
 }
 // Group keys carry their own prefix, so a group send can never match a 1:1 receipt.
 function groupReceiptKey(conversationId, message) {
