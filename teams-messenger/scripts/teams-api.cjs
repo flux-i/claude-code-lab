@@ -202,6 +202,34 @@ async function createMeeting(session, subject, options, { force = false, now = D
     throw fail('send_result_ambiguous', 'The meeting was created but could not be read back to confirm it. No automatic retry was made.');
   }
 }
+// Picks the newest file the other person sent. Several files in one message need an explicit --file.
+function latestAttachment(messages, fileName) {
+  for (const message of [...messages].reverse()) {
+    if (message.fromMe) continue;
+    const files = (message.attachments || []).filter(file => !fileName || file.fileName === fileName);
+    if (files.length === 1) return { message, attachment: files[0] };
+    if (files.length > 1) throw fail('attachment_choice_required', 'That message has several files. Choose one with --file: ' + files.map(file => file.fileName).join(', '));
+  }
+  throw fail('attachment_not_found', fileName ? 'No file with that exact name was found from this person.' : 'No file from this person was found in recent history.');
+}
+function downloadDirectory(value) {
+  let resolved;
+  if (typeof value !== 'string' || !path.isAbsolute(value)) throw fail('invalid_download_folder', 'Use one absolute folder path.');
+  try { resolved = fs.realpathSync(value); fs.accessSync(resolved, fs.constants.W_OK); }
+  catch (_) { throw fail('invalid_download_folder', 'The download folder is not writable.'); }
+  if (!fs.statSync(resolved).isDirectory()) throw fail('invalid_download_folder', 'The download path is not a folder.');
+  return resolved;
+}
+async function downloadFile(session, recipient, directory, { fileName } = {}) {
+  const binding = await session.resolve(email(recipient));
+  const service = new ChatService(session);
+  const recipientProof = await service.verify(binding);
+  const { messages } = await service.history(binding, { limit: 500, scan: 5000 });
+  const { message, attachment } = latestAttachment(messages, fileName);
+  const file = await new SharePointService(session).downloadAttachment(attachment, directory);
+  return { verified: true, recipient: binding.recipient, recipientProof, transport: TRANSPORT,
+    sentAt: message.timestamp, sentBy: message.author, file };
+}
 function contacts(query = '') {
   return fs.readFileSync(path.join(__dirname, 'teams_contacts.txt'), 'utf8').split(/\r?\n/)
     .filter(line => line.trim() && !line.trim().startsWith('#') && line.includes('='))
@@ -234,7 +262,7 @@ function argumentsFor(argv) {
     if (['--force', '--case-sensitive'].includes(token)) {
       if (options[token]) throw fail('invalid_arguments', 'A flag was repeated.');
       options[token] = true;
-    } else if (['--limit', '--max-scan', '--after', '--before', '--message', '--start', '--duration', '--timezone', '--attendees'].includes(token)) {
+    } else if (['--limit', '--max-scan', '--after', '--before', '--message', '--start', '--duration', '--timezone', '--attendees', '--file'].includes(token)) {
       if (options[token] !== undefined || input[i + 1] === undefined) throw fail('invalid_arguments', 'A flag value was missing or repeated.');
       options[token] = input[++i];
     } else if (token.startsWith('--')) throw fail('invalid_arguments', 'Unknown option: ' + token);
@@ -242,7 +270,7 @@ function argumentsFor(argv) {
   }
   const allowed = { send: ['--force'], 'send-file': ['--force', '--message'], 'group-send': ['--force'],
     'group-send-file': ['--force', '--message'], 'group-info': [],
-    list: ['--limit'], read: ['--limit'],
+    list: ['--limit'], read: ['--limit'], download: ['--file'],
     'meeting-preview': ['--start', '--duration', '--timezone', '--attendees', '--message'],
     meeting: ['--start', '--duration', '--timezone', '--attendees', '--message', '--force'], search: ['--limit', '--max-scan', '--after', '--before', '--case-sensitive'] };
   if (Object.keys(options).some(option => !(allowed[command] || []).includes(option))) throw fail('invalid_arguments', 'This command does not accept that option.');
@@ -258,6 +286,7 @@ const usage = `Usage:
   teams send-file <exact-email> <absolute-path> [--message <caption>] [--force]
   teams read <exact-email> [--limit 20]
   teams search <exact-email> <text> [--limit 20] [--max-scan 5000] [--after ISO] [--before ISO] [--case-sensitive]
+  teams download <exact-email> <absolute-folder> [--file <exact-file-name>]
   teams group-info <group-chat-id> <exact-group-name>
   teams group-send <group-chat-id> <exact-group-name> <message> [--force]
   teams group-send-file <group-chat-id> <exact-group-name> <absolute-path> [--message <caption>] [--force]
@@ -282,10 +311,11 @@ async function main(argv) {
     if (args.length > 1) throw fail('invalid_arguments', usage);
     emit({ readOnly: true, contacts: contacts(args[0]) }); return;
   }
-  const counts = { status: 0, lookup: 1, list: 0, send: 2, 'send-file': 2, read: 1, search: 2,
+  const counts = { status: 0, lookup: 1, list: 0, send: 2, 'send-file': 2, read: 1, search: 2, download: 2,
     'group-info': 2, 'group-send': 3, 'group-send-file': 3, 'meeting-preview': 1, meeting: 1 };
   if (counts[command] === undefined || args.length !== counts[command]) throw fail('invalid_arguments', usage);
-  if (['send', 'send-file', 'read', 'search'].includes(command)) email(args[0]);
+  if (['send', 'send-file', 'read', 'search', 'download'].includes(command)) email(args[0]);
+  if (command === 'download') downloadDirectory(args[1]);
   if (command.startsWith('group-')) { groupThreadId(args[0]); groupName(args[1]); }
   if (command === 'group-send' && !args[2].trim()) throw fail('empty_message', 'Message text cannot be empty.');
   if (command === 'group-send-file') await localFile(args[2]);
@@ -329,6 +359,7 @@ async function main(argv) {
     } else if (command === 'group-send') emit(await sendGroupText(session, args[0], args[1], args[2], { force: Boolean(options['--force']) }));
     else if (command === 'group-send-file') emit(await sendGroupFile(session, args[0], args[1], args[2], {
       force: Boolean(options['--force']), message: options['--message'] || '' }));
+    else if (command === 'download') emit(await downloadFile(session, args[0], downloadDirectory(args[1]), { fileName: options['--file'] }));
     else if (command === 'list') {
       const { value } = await service.request(session.credentials.base + '?pageSize=100');
       if (!Array.isArray(value.conversations)) throw fail('conversation_list_invalid', 'Teams did not return a conversation list.');
@@ -349,5 +380,5 @@ if (require.main === module) main(process.argv.slice(2)).catch(error => {
   process.exitCode = error.code === 'send_result_ambiguous' ? 3 : 1;
 });
 
-module.exports = { argumentsFor, attachmentPayload, contacts, createMeeting, meetingKey, meetingPlan, meetingSummary, dateBound, integer, localFile, main, postVerified, sendFile,
+module.exports = { argumentsFor, attachmentPayload, contacts, downloadDirectory, downloadFile, latestAttachment, createMeeting, meetingKey, meetingPlan, meetingSummary, dateBound, integer, localFile, main, postVerified, sendFile,
   sendGroupFile, sendGroupText, sendText };

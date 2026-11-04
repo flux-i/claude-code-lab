@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const path = require('node:path');
 const crypto = require('node:crypto');
 const { fail } = require('./chat-session.cjs');
 function sharepointUrl(value, origin) {
@@ -183,6 +184,42 @@ class SharePointService {
     for await (const bytes of response.body) hash.update(bytes);
     return hash.digest('hex');
   }
+  // Fetches a file someone shared in chat. The name and URL come from a message, so both are untrusted:
+  // the URL must be on this tenant's OneDrive, and the file is never allowed to overwrite anything.
+  async downloadAttachment(attachment, directory) {
+    const origin = this.personalOrigin();
+    if (!attachment.url) throw fail('attachment_url_unavailable', 'The message does not include a file link.');
+    const source = sharepointUrl(attachment.url, origin);
+    const shareId = 'u!' + Buffer.from(source.href).toString('base64url');
+    const item = await this.json(origin + '/_api/v2.0/shares/' + shareId + '/driveItem');
+    const raw = item['@content.downloadUrl'] || item['@microsoft.graph.downloadUrl'];
+    if (!raw || !item.file) throw fail('download_url_unavailable', 'OneDrive did not return a download URL for this file.');
+    const name = safeFileName(attachment.fileName);
+    const url = sharepointUrl(raw, origin);
+    let response;
+    try { response = await this.fetch(url.href, { redirect: 'manual', signal: AbortSignal.timeout(300000) }); }
+    catch (_) { throw fail('download_failed', 'The file download did not return a response.'); }
+    if (!response.ok || !response.body) {
+      await response.body?.cancel(); throw fail('download_failed', `The file download returned HTTP ${response.status}.`);
+    }
+    const target = path.join(directory, name);
+    const temporary = path.join(directory, '.' + crypto.randomUUID() + '.part');
+    const hash = crypto.createHash('sha256');
+    let size = 0;
+    const fd = fs.openSync(temporary, 'wx', 0o600);
+    try {
+      try {
+        for await (const bytes of response.body) { hash.update(bytes); size += bytes.length; fs.writeSync(fd, bytes); }
+      } finally { fs.closeSync(fd); }
+      if (Number.isInteger(item.size) && item.size !== size) throw fail('download_size_not_verified', 'The downloaded size does not match OneDrive.');
+      try { fs.linkSync(temporary, target); } // Unlike rename, this refuses to replace an existing file.
+      catch (error) {
+        if (error.code === 'EEXIST') throw fail('download_target_exists', 'A file with this name already exists in that folder.');
+        throw error;
+      }
+    } finally { fs.rmSync(temporary, { force: true }); }
+    return { path: target, fileName: name, size, contentSha256: hash.digest('hex') };
+  }
   async share(uploaded, binding) {
     const { drive, item } = uploaded;
     const result = await this.json(drive.api + '/items/' + encodeURIComponent(item.id) + '/oneDrive.invite', {
@@ -215,6 +252,13 @@ class SharePointService {
   }
 }
 
+function safeFileName(value) {
+  const name = String(value || '');
+  if (!name || name === '.' || name === '..' || name.startsWith('.') || /[/\\\x00-\x1f]/.test(name)) {
+    throw fail('attachment_name_unsafe', 'The attachment name is not a safe file name.');
+  }
+  return name;
+}
 function permissionIdentities(permission) {
   return [permission.grantedToV2, permission.grantedTo, ...(permission.grantedToIdentitiesV2 || []),
     ...(permission.grantedToIdentities || [])].filter(Boolean);
@@ -243,4 +287,4 @@ function verifyPermissions(permissions, binding, sender) {
   return true;
 }
 
-module.exports = { SharePointService, personIdentity, sharepointUrl, verifyPermissionSet, verifyPermissions };
+module.exports = { SharePointService, personIdentity, safeFileName, sharepointUrl, verifyPermissionSet, verifyPermissions };

@@ -372,3 +372,30 @@ test('meeting CLI flags',()=>{
  code(()=>argumentsFor(['meeting-preview','Sync','--force']),'invalid_arguments');
  code(()=>argumentsFor(['send','a@x.com','hi','--start','x']),'invalid_arguments');
 });
+
+test('download picks the newest file from the other person and needs a choice for several',()=>{
+ const {latestAttachment}=require('../teams-api.cjs');
+ const a={fileName:'a.txt'},b={fileName:'b.txt'},c={fileName:'c.txt'};
+ const m=[{id:1,attachments:[a]},{id:2,attachments:[b,c]},{id:3,fromMe:true,attachments:[{fileName:'mine.txt'}]},{id:4,attachments:[]}];
+ assert.equal(latestAttachment(m,'a.txt').attachment,a);
+ assert.equal(latestAttachment(m,'c.txt').attachment,c);
+ assert.equal(latestAttachment(m.slice(0,1)).attachment,a);
+ code(()=>latestAttachment(m),'attachment_choice_required');
+ code(()=>latestAttachment(m,'mine.txt'),'attachment_not_found');
+});
+test('download refuses unsafe names, other hosts and overwriting',async()=>{
+ const {safeFileName}=require('../sharepoint-service.cjs');
+ for(const bad of ['','..','.env','../x','a/b','a\\b','a\nb'])code(()=>safeFileName(bad),'attachment_name_unsafe');
+ assert.equal(safeFileName('search 3.html'),'search 3.html');
+ const origin='https://tenant-my.sharepoint.com',dir=fs.mkdtempSync(path.join(directory,'dl-'));
+ const s={resources:[{origin}],resource:()=>({secret:'x'}),refresh:async()=>{}};
+ const fetcher=async url=>String(url).includes('/shares/')?json({file:{},size:5,'@content.downloadUrl':origin+'/signed'}):new Response('hello');
+ const api=new SharePointService(s,fetcher),file={fileName:'a.txt',url:origin+'/personal/p/Documents/a.txt'};
+ const result=await api.downloadAttachment(file,dir);
+ assert.equal(fs.readFileSync(result.path,'utf8'),'hello');assert.equal(result.size,5);
+ await assert.rejects(api.downloadAttachment(file,dir),e=>e.code==='download_target_exists');
+ await assert.rejects(api.downloadAttachment({...file,url:'https://evil.example/a.txt'},dir),e=>e.code==='sharepoint_scope_changed');
+ const short=new SharePointService(s,async url=>String(url).includes('/shares/')?json({file:{},size:9,'@content.downloadUrl':origin+'/signed'}):new Response('hello'));
+ await assert.rejects(short.downloadAttachment({...file,fileName:'b.txt'},dir),e=>e.code==='download_size_not_verified');
+ assert.deepEqual(fs.readdirSync(dir),['a.txt']);
+});
